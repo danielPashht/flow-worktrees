@@ -3,19 +3,22 @@
 State lives in `<primary>/local-docs/tasks/<KEY>.md` (YAML frontmatter + free notes), where
 `<primary>` is the main checkout; worktrees see the same directory through a `local-docs` symlink.
 Nothing here is committed: `local-docs/` is gitignored in every repo that uses this tool.
-The task file keeps only what GitLab cannot know; the MR, the stages after it and the ball are derived from
-GitLab's answers, cached in `<primary>/local-docs/.flow-cache/forge.json` so the SessionStart hook stays offline.
+The task file keeps only what the forge cannot know; the MR (a PR on GitHub), the stages after it and the ball are
+derived from the forge's answers -- GitLab through `glab`, GitHub through `gh` -- cached in
+`<primary>/local-docs/.flow-cache/forge.json` so the SessionStart hook stays offline.
 
-Human-only commands (`start`, `clean`, `migrate`, `set stage parked`) refuse to run when
+Human-only commands (`start`, `clean`, `migrate`, `set stage parked`, `install-hook`) refuse to run when
 CLAUDECODE=1 is set — that is the Claude Code Bash environment. FLOW_HUMAN=1 overrides.
 
 Per-repo overrides live in `<primary>/local-docs/flow.local.yml`:
 
+    forge: github                      # gitlab | github; default: told from origin's host
     base_branch: main                  # default: origin/HEAD
     worktree_dir: ../myrepo-{n}        # default: ../<primary dir minus last -segment>-{n}
     gate: make check BASE={base}   # the pre-review check, any shell command; no default, `--no-gate --why` skips it
     jira_base: https://jira.example.com     # optional: keys in `status --html` link to /browse/<KEY>
     overlap_ignore: [".metrics/*"]          # optional: files whose overlap between branches is not a conflict
+    approvals_required: 1                    # approvals that make an MR merge-wait
 
 Run `flow --help`, or `flow guide`, for the user flow.
 """
@@ -23,6 +26,7 @@ Run `flow --help`, or `flow guide`, for the user flow.
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import dataclasses
 import datetime as dt
@@ -36,7 +40,7 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 import yaml
 
@@ -47,7 +51,7 @@ STAGES = [
 ]
 WORK_STAGES = ["plan", "refine", "implement", "test"]
 INACTIVE = {"merged", "cleaned", "parked"}
-# Stages GitLab decides; the task file never stores them (a legacy file still may, until `flow migrate`).
+# Stages the forge decides; the task file never stores them (a legacy file still may, until `flow migrate`).
 FORGE_STAGES = {"review-wait", "changes", "merge-wait", "merged"}
 STORED_STAGES = WORK_STAGES + ["parked"]
 # GitLab system notes worth a journal line; the rest ("added 3 commits", "changed this line") is noise that the
@@ -68,11 +72,15 @@ KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 KEY_IN_BRANCH = re.compile(r"^([A-Z][A-Z0-9]+-\d+)")
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.S)
-GLAB_TIMEOUT = 25
-GLAB_NETWORK_ERRORS = ("i/o timeout", "dial tcp", "no such host", "connection refused")
+FORGE_TIMEOUT = 25
+FORGE_NETWORK_ERRORS = ("i/o timeout", "dial tcp", "no such host", "connection refused", "error connecting to")
 # 401 as a status token, not as digits inside an iid/path (`!401`, `/4012`).
-GLAB_AUTH_ERROR = re.compile(r"(?<![\w!/])401(?!\d)|Unauthorized")
-GLAB_FORBIDDEN = re.compile(r"(?<![\w!/])403(?!\d)|Forbidden")
+FORGE_AUTH_ERROR = re.compile(r"(?<![\w!#/])401(?!\d)|Unauthorized|Bad credentials")
+FORGE_FORBIDDEN = re.compile(r"(?<![\w!#/])403(?!\d)|Forbidden")
+FORGE_NOT_FOUND = re.compile(r"(?<![\w!#/])404(?!\d)|Not Found")
+# Per forge: its CLI, product name, what a change request is called, and how its number is written.
+ForgeWords = collections.namedtuple("ForgeWords", "cli product noun prefix")
+FORGES = {"gitlab": ForgeWords("glab", "GitLab", "MR", "!"), "github": ForgeWords("gh", "GitHub", "PR", "#")}
 NEXT_WIDTH = 60  # `next` column cap in the terminal table
 OVERLAP_FILES_SHOWN = 3  # files named per overlap line before "+N more"
 MERGED_STALE_DAYS = 3  # `flow doctor` asks for `flow clean` once a merged task is this old
@@ -165,6 +173,23 @@ def require_human(action: str) -> None:
 # --------------------------------------------------------------------------- repo
 
 
+def url_host(url: str) -> str:
+    """The host of a git remote URL: `https://h/…`, `ssh://user@h:port/…`, or scp-like `user@h:path`."""
+    url = url.strip()
+    if "://" in url:
+        return (urllib.parse.urlsplit(url).hostname or "").lower()
+    match = re.match(r"^(?:[^@/]+@)?([^:/]+):", url)
+    return match.group(1).lower() if match else ""
+
+
+def forge_for_host(host: str) -> str | None:
+    if "github" in host:
+        return "github"
+    if "gitlab" in host:
+        return "gitlab"
+    return None
+
+
 class Repo:
     def __init__(self, cwd: Path | None = None):
         cwd = (cwd or Path.cwd()).resolve()
@@ -192,9 +217,34 @@ class Repo:
             raise FlowError(f"{path} must be a mapping")
         return data
 
+    @functools.cached_property
+    def forge_name(self) -> str:
+        """`forge:` from flow.local.yml, else guessed from origin's host; a host that names neither is an error."""
+        configured = self.config.get("forge")
+        if configured is not None:
+            if configured not in FORGES:
+                raise FlowError(f"flow.local.yml `forge` must be one of {', '.join(FORGES)}, not {configured!r}")
+            return str(configured)
+        url = git("remote", "get-url", "origin", cwd=self.primary, check=False)
+        host = url_host(url)
+        guessed = forge_for_host(host)
+        if guessed is None:
+            raise FlowError(f"cannot tell the forge from origin's host {host or url or '(no origin)'!r}; "
+                            f"set `forge: gitlab` or `forge: github` in {self.local_docs / 'flow.local.yml'}")
+        return guessed
+
+    @property
+    def words(self) -> ForgeWords:
+        """How to name this repo's forge in output. An undetectable forge reads as GitLab here and fails only where
+        a forge is actually called, so the offline hook still renders."""
+        try:
+            return FORGES[self.forge_name]
+        except FlowError:
+            return FORGES["gitlab"]
+
     @property
     def approvals_required(self) -> int:
-        """Approvals that move review-wait -> merge-wait; GitLab's own rule is not queryable per project via glab."""
+        """Approvals that move review-wait -> merge-wait; neither forge's own rule is queryable per project."""
         value = self.config.get("approvals_required", 1)
         if not isinstance(value, int) or value < 1:
             raise FlowError("flow.local.yml `approvals_required` must be a positive integer")
@@ -351,58 +401,116 @@ def pick_key(repo: Repo, key: str | None, action: str) -> str:
     return current
 
 
-# --------------------------------------------------------------------------- forge (GitLab via glab)
+# --------------------------------------------------------------------------- forges
 
 
-class Glab:
+class Forge(Protocol):
+    """What flow asks a forge. Every MR it returns is normalized by `neutral_mr` (plus `iid`), so the cache, the
+    derivation of stage and ball, and every renderer never see a GitLab or GitHub payload."""
+
+    name: str
+    cli: str
+
+    def username(self) -> str: ...
+    def latest_mr_for_branch(self, branch: str) -> dict | None: ...
+    def mrs_by_iid(self, iids: list[int]) -> dict[int, dict]: ...
+    def mr_view(self, iid: int) -> dict: ...
+    def details(self, iid: int, entry: dict, is_open: bool) -> dict: ...  # approvals, threads, events, maybe more
+    def mr_create(self, branch: str, base: str, title: str) -> int: ...
+
+
+def neutral_mr(iid: int, *, state: str, draft: bool, author: str, source_branch: str, sha: str, merge_status: str,
+               web_url: str, created_at: str, merged_at: str) -> dict:
+    """The one MR shape the cache stores. `merge_status` is `mergeable` exactly when the forge would merge now."""
+    return {"iid": iid, "state": state, "draft": draft, "author": author, "source_branch": source_branch, "sha": sha,
+            "merge_status": merge_status, "web_url": web_url, "merged_at": merged_at[:10], "approvals": 0,
+            "threads": [], "created_at": created_at, "merged_at_full": merged_at, "events": []}
+
+
+def login(value: object, field: str = "username") -> str:
+    return str(value.get(field) or "") if isinstance(value, dict) else ""
+
+
+def lifecycle_events(prefix: str, ref: str, entry: dict) -> list[dict]:
+    """MR created / merged, from the MR itself: both forges report them, neither as a timeline item flow keeps."""
+    events = []
+    for kind, at in (("mr-created", entry.get("created_at")), ("mr-merged", entry.get("merged_at_full"))):
+        ts = iso_ts(at or "")
+        if ts:
+            events.append({"id": f"{prefix}:{ref}:{kind}", "ts": ts, "kind": kind, "text": ref})
+    return events
+
+
+class ForgeCli:
+    """A forge reached through its CLI: one subprocess per call, and a connectivity or auth failure remembered, so
+    the rest of the process fails at once instead of waiting out the same timeout again."""
+
+    name = ""
+    cli = ""
+
     def __init__(self, root: Path):
         self.root = root
-        self.dead: FlowError | None = None  # first connectivity/auth failure; later calls re-raise it at once
+        self.dead: FlowError | None = None
 
     def _fail(self, message: str) -> FlowError:
-        """A failure that will repeat for every call in this process: remember it, do not wait for it again."""
         self.dead = FlowError(message, EXIT_PRECONDITION)
         return self.dead
 
-    def _run(self, args: list[str]) -> str:
+    def _run(self, args: list[str], missing_ok: bool = False) -> str | None:
+        """stdout; `None` for a 404 when `missing_ok`, which is an answer ("no such MR"), not a failure."""
         if self.dead:
             raise self.dead
         try:
-            result = subprocess.run(["glab", *args], cwd=self.root, capture_output=True, text=True,
-                                    timeout=GLAB_TIMEOUT)
+            result = subprocess.run([self.cli, *args], cwd=self.root, capture_output=True, text=True,
+                                    timeout=FORGE_TIMEOUT)
         except FileNotFoundError as error:
-            raise self._fail("glab is not installed") from error
+            raise self._fail(f"{self.cli} is not installed") from error
         except subprocess.TimeoutExpired as error:
-            raise self._fail(f"glab offline: timed out after {GLAB_TIMEOUT}s (VPN?)") from error
+            raise self._fail(f"{self.cli} offline: timed out after {FORGE_TIMEOUT}s (VPN?)") from error
         if result.returncode != 0:
             err = result.stderr.strip()
-            if any(marker in err for marker in GLAB_NETWORK_ERRORS):
-                raise self._fail(f"glab offline: {err.splitlines()[-1] if err else 'unreachable (VPN?)'}")
-            if GLAB_AUTH_ERROR.search(err):
-                raise self._fail("glab auth: 401 — run `glab auth login`")
-            if GLAB_FORBIDDEN.search(err):
+            if any(marker in err for marker in FORGE_NETWORK_ERRORS):
+                raise self._fail(f"{self.cli} offline: {err.splitlines()[-1] if err else 'unreachable (VPN?)'}")
+            if FORGE_AUTH_ERROR.search(err):
+                raise self._fail(f"{self.cli} auth: 401 — run `{self.cli} auth login`")
+            if FORGE_FORBIDDEN.search(err):
                 # One endpoint refusing is not the forge going away: later calls may still be allowed.
-                raise FlowError(f"glab: 403 — the token lacks scope or project access changed ({err.splitlines()[-1]})",
-                                EXIT_PRECONDITION)
-            raise FlowError(f"glab: {err or 'failed'}", EXIT_PRECONDITION)
+                raise FlowError(f"{self.cli}: 403 — the token lacks scope or project access changed "
+                                f"({err.splitlines()[-1]})", EXIT_PRECONDITION)
+            if missing_ok and FORGE_NOT_FOUND.search(err):
+                return None
+            raise FlowError(f"{self.cli}: {err or 'failed'}", EXIT_PRECONDITION)
         return result.stdout
 
-    def api(self, path: str) -> object:
-        out = self._run(["api", path])
+    def api(self, path: str, *fields: str, missing_ok: bool = False) -> object:
+        out = self._run(["api", path, *fields], missing_ok=missing_ok)
+        if out is None:
+            return None
         try:
             return json.loads(out)
         except json.JSONDecodeError as error:
-            raise FlowError(f"glab: non-JSON response for {path}", EXIT_PRECONDITION) from error
+            raise FlowError(f"{self.cli}: non-JSON response for {path}", EXIT_PRECONDITION) from error
+
+
+class Glab(ForgeCli):
+    """GitLab through `glab api`, which resolves `:id` to the checkout's project."""
+
+    name, cli = "gitlab", "glab"
+
+    @staticmethod
+    def _mr(data: dict) -> dict:
+        return neutral_mr(
+            int(data["iid"]), state=str(data.get("state", "?")), draft=bool(data.get("draft")),
+            author=login(data.get("author")), source_branch=str(data.get("source_branch") or ""),
+            sha=str(data.get("sha") or ""), merge_status=str(data.get("detailed_merge_status") or ""),
+            web_url=str(data.get("web_url") or ""), created_at=str(data.get("created_at") or ""),
+            merged_at=str(data.get("merged_at") or ""))
 
     def mr_view(self, iid: int) -> dict:
         data = self.api(f"projects/:id/merge_requests/{iid}")
         if not isinstance(data, dict):
             raise FlowError(f"glab: unexpected payload for !{iid}", EXIT_PRECONDITION)
-        return data
-
-    def mr_approvals(self, iid: int) -> int:
-        data = self.api(f"projects/:id/merge_requests/{iid}/approvals")
-        return len(data.get("approved_by", [])) if isinstance(data, dict) else 0
+        return self._mr(data)
 
     def mrs_by_iid(self, iids: list[int]) -> dict[int, dict]:
         """One request per 50 iids instead of one per MR; an iid the API does not return is simply absent."""
@@ -411,10 +519,10 @@ class Glab:
             query = "&".join(f"iids[]={iid}" for iid in iids[start:start + 50])
             data = self.api(f"projects/:id/merge_requests?{query}&per_page=50")
             if isinstance(data, list):
-                found.update({int(d["iid"]): d for d in data if isinstance(d, dict) and "iid" in d})
+                found.update({int(d["iid"]): self._mr(d) for d in data if isinstance(d, dict) and "iid" in d})
         return found
 
-    def mr_for_branch(self, branch: str) -> dict | None:
+    def _open_mr_for_branch(self, branch: str) -> dict | None:
         data = self.api(f"projects/:id/merge_requests?source_branch={quote(branch)}&state=opened&per_page=5")
         return data[0] if isinstance(data, list) and data else None
 
@@ -422,29 +530,232 @@ class Glab:
         """Any state: a merged or closed MR is still the branch's MR. Newest first, so a reopened branch wins."""
         data = self.api(f"projects/:id/merge_requests?source_branch={quote(branch)}&state=all"
                         "&order_by=created_at&sort=desc&per_page=5")
-        return data[0] if isinstance(data, list) and data else None
+        return self._mr(data[0]) if isinstance(data, list) and data else None
 
-    def discussions(self, iid: int) -> list:
+    def details(self, iid: int, entry: dict, is_open: bool) -> dict:
+        """Approvals (open MRs only: a settled one's count moves nothing) and the discussions behind threads."""
+        approvals = 0
+        if is_open:
+            data = self.api(f"projects/:id/merge_requests/{iid}/approvals")
+            approvals = len(data.get("approved_by", [])) if isinstance(data, dict) else 0
         data = self.api(f"projects/:id/merge_requests/{iid}/discussions?per_page=100")
-        return data if isinstance(data, list) else []
+        discussions = data if isinstance(data, list) else []
+        return {"approvals": approvals, "threads": self._threads(discussions),
+                "events": lifecycle_events("gl", f"!{iid}", entry) + self._events(iid, discussions)}
+
+    @staticmethod
+    def _threads(discussions: list) -> list[dict]:
+        """Resolvable review threads only: a plain comment carries no obligation that a reply discharges."""
+        threads = []
+        for discussion in discussions:
+            notes = [n for n in (discussion.get("notes") or []) if isinstance(n, dict) and not n.get("system")]
+            resolvable = [n for n in notes if n.get("resolvable")]
+            if not resolvable:
+                continue
+            threads.append({"resolved": all(n.get("resolved") for n in resolvable),
+                            "last_author": login(notes[-1].get("author")),
+                            "last_note_id": int(notes[-1].get("id") or 0)})
+        return threads
+
+    @staticmethod
+    def _events(iid: int, discussions: list) -> list[dict]:
+        """Journal lines from notes: review requests, approvals and state changes, and human comments."""
+        events = []
+        for discussion in discussions:
+            for note in discussion.get("notes") or []:
+                if not isinstance(note, dict) or not note.get("id"):
+                    continue
+                ts = iso_ts(str(note.get("created_at") or ""))
+                author = login(note.get("author")) or "?"
+                body = " ".join(str(note.get("body") or "").replace("**", "").split())
+                if note.get("system"):
+                    if ts and JOURNAL_SYSTEM_NOTES.match(body):
+                        events.append({"id": f"gl:{note['id']}", "ts": ts, "kind": "gitlab",
+                                       "text": f"!{iid} {author} {truncate(body, 100)}"})
+                elif ts:
+                    events.append({"id": f"gl:{note['id']}", "ts": ts, "kind": "comment",
+                                   "text": f"!{iid} {author}: {truncate(body, 100)}"})
+        return events
 
     def username(self) -> str:
-        data = self.api("user")
-        name = data.get("username") if isinstance(data, dict) else None
+        name = login(self.api("user"))
         if not name:
             raise FlowError("glab: `user` returned no username", EXIT_PRECONDITION)
-        return str(name)
+        return name
 
     def mr_create(self, branch: str, base: str, title: str) -> int:
         out = self._run(["mr", "create", "--draft", "--title", title, "--description", "",
-                         "--source-branch", branch, "--target-branch", base, "--yes"])
+                         "--source-branch", branch, "--target-branch", base, "--yes"]) or ""
         printed = re.search(r"/-/merge_requests/(\d+)", out)  # glab prints the new MR's URL
         if printed:
             return int(printed.group(1))
-        created = self.mr_for_branch(branch)
+        created = self._open_mr_for_branch(branch)
         if not created:
             raise FlowError("glab: MR created but not found by source branch", EXIT_PRECONDITION)
         return int(created["iid"])
+
+
+# One round trip per PR for everything REST would need five calls for. `latestReviews` holds each reviewer's
+# latest verdict; `reviewThreads` are the resolvable conversations; the timeline feeds the journal.
+GH_PR_QUERY = """query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      isDraft mergeStateStatus
+      commits(last: 1) { nodes { commit { committedDate } } }
+      latestReviews(first: 50) { nodes { databaseId state submittedAt author { login } } }
+      reviewThreads(first: 100) { nodes { isResolved comments(last: 1) { nodes { databaseId author { login } } } } }
+      timelineItems(first: 100, itemTypes: [READY_FOR_REVIEW_EVENT, CONVERT_TO_DRAFT_EVENT, REVIEW_REQUESTED_EVENT,
+                                            PULL_REQUEST_REVIEW, MERGED_EVENT, CLOSED_EVENT, REOPENED_EVENT,
+                                            ASSIGNED_EVENT, ISSUE_COMMENT]) {
+        nodes {
+          __typename
+          ... on ReadyForReviewEvent { id createdAt actor { login } }
+          ... on ConvertToDraftEvent { id createdAt actor { login } }
+          ... on ReviewRequestedEvent { id createdAt actor { login }
+                                        requestedReviewer { ... on User { login } ... on Team { name } } }
+          ... on PullRequestReview { id submittedAt state body author { login } }
+          ... on MergedEvent { id createdAt actor { login } }
+          ... on ClosedEvent { id createdAt actor { login } }
+          ... on ReopenedEvent { id createdAt actor { login } }
+          ... on AssignedEvent { id createdAt actor { login } assignee { ... on User { login } } }
+          ... on IssueComment { id createdAt body author { login } }
+        }
+      }
+    }
+  }
+}"""
+GH_TIMELINE_VERBS = {"ReadyForReviewEvent": "marked as ready", "ConvertToDraftEvent": "marked as draft",
+                     "MergedEvent": "merged", "ClosedEvent": "closed", "ReopenedEvent": "reopened"}
+GH_REVIEW_VERBS = {"APPROVED": "approved", "CHANGES_REQUESTED": "requested changes", "DISMISSED": "review dismissed"}
+
+
+class Gh(ForgeCli):
+    """GitHub through `gh api`, which fills `{owner}`/`{repo}` from the checkout and follows its host (Enterprise)."""
+
+    name, cli = "github", "gh"
+
+    @staticmethod
+    def _mr(data: dict) -> dict:
+        merged_at = str(data.get("merged_at") or "")
+        state = "merged" if merged_at else ("opened" if data.get("state") == "open" else "closed")
+        head = data.get("head") if isinstance(data.get("head"), dict) else {}
+        mergeable = str(data.get("mergeable_state") or "")  # only single-PR reads carry it; `details` refreshes it
+        return neutral_mr(
+            int(data["number"]), state=state, draft=bool(data.get("draft")), author=login(data.get("user"), "login"),
+            source_branch=str(head.get("ref") or ""), sha=str(head.get("sha") or ""),
+            merge_status="mergeable" if mergeable == "clean" else mergeable, web_url=str(data.get("html_url") or ""),
+            created_at=str(data.get("created_at") or ""), merged_at=merged_at)
+
+    def mr_view(self, iid: int) -> dict:
+        data = self.api(f"repos/{{owner}}/{{repo}}/pulls/{iid}")
+        if not isinstance(data, dict):
+            raise FlowError(f"gh: unexpected payload for #{iid}", EXIT_PRECONDITION)
+        return self._mr(data)
+
+    def mrs_by_iid(self, iids: list[int]) -> dict[int, dict]:
+        """GitHub has no batch read by number over REST; the calls fan out instead. A 404 is simply absent."""
+        answers = parallel([lambda i=i: self.api(f"repos/{{owner}}/{{repo}}/pulls/{i}", missing_ok=True)
+                            for i in iids])
+        return {iid: self._mr(data) for iid, data in zip(iids, answers) if isinstance(data, dict)}
+
+    def latest_mr_for_branch(self, branch: str) -> dict | None:
+        data = self.api(f"repos/{{owner}}/{{repo}}/pulls?head={{owner}}:{quote(branch)}&state=all"
+                        "&sort=created&direction=desc&per_page=5")
+        return self._mr(data[0]) if isinstance(data, list) and data else None
+
+    def details(self, iid: int, entry: dict, is_open: bool) -> dict:
+        data = self.api("graphql", "-f", f"query={GH_PR_QUERY}", "-F", "owner={owner}", "-F", "repo={repo}",
+                        "-F", f"number={iid}")
+        pr = (((data or {}).get("data") or {}).get("repository") or {}).get("pullRequest") if isinstance(data, dict) \
+            else None
+        if not isinstance(pr, dict):
+            raise FlowError(f"gh: no pull request #{iid} in the GraphQL answer", EXIT_PRECONDITION)
+        reviews = nodes(pr.get("latestReviews"))
+        status = str(pr.get("mergeStateStatus") or "")
+        return {"approvals": sum(r.get("state") == "APPROVED" for r in reviews) if is_open else 0,
+                "threads": self._threads(pr, reviews, entry["author"]),
+                "events": lifecycle_events("gh", f"#{iid}", entry) + self._events(iid, nodes(pr.get("timelineItems"))),
+                "draft": bool(pr.get("isDraft")),
+                "merge_status": "mergeable" if status == "CLEAN" else status.lower()}
+
+    @staticmethod
+    def _threads(pr: dict, reviews: list[dict], author: str) -> list[dict]:
+        """Review threads, plus one open thread per standing "changes requested" verdict.
+
+        A verdict has nothing to resolve, and GitHub keeps it until the reviewer reviews again. Until the author
+        pushes after it, the reviewer spoke last (the author owes the change); after the push the author did (the
+        reviewer owes the re-review). `forge_stage` then reads it like any other thread.
+        """
+        threads = []
+        for thread in nodes(pr.get("reviewThreads")):
+            last = (nodes(thread.get("comments")) or [{}])[-1]
+            threads.append({"resolved": bool(thread.get("isResolved")), "last_author": login(last.get("author"), "login"),
+                            "last_note_id": int(last.get("databaseId") or 0)})
+        head = iso_ts(str(((nodes(pr.get("commits")) or [{}])[-1].get("commit") or {}).get("committedDate") or ""))
+        for review in reviews:
+            if review.get("state") != "CHANGES_REQUESTED":
+                continue
+            at = iso_ts(str(review.get("submittedAt") or ""))
+            answered = head is not None and at is not None and head > at
+            threads.append({"resolved": False,
+                            "last_author": author if answered else login(review.get("author"), "login"),
+                            "last_note_id": int(review.get("databaseId") or 0)})
+        return threads
+
+    @staticmethod
+    def _events(iid: int, items: list[dict]) -> list[dict]:
+        events = []
+        for item in items:
+            kind = item.get("__typename")
+            ts = iso_ts(str(item.get("createdAt") or item.get("submittedAt") or ""))
+            if not ts or not item.get("id"):
+                continue
+            actor = login(item.get("actor") or item.get("author"), "login") or "?"
+            body = " ".join(str(item.get("body") or "").split())
+            if kind in GH_TIMELINE_VERBS:
+                text = f"#{iid} {actor} {GH_TIMELINE_VERBS[kind]}"
+            elif kind == "ReviewRequestedEvent":
+                who = item.get("requestedReviewer") or {}
+                text = f"#{iid} {actor} requested review from {who.get('login') or who.get('name') or '?'}"
+            elif kind == "AssignedEvent":
+                text = f"#{iid} {actor} assigned to {login(item.get('assignee'), 'login') or '?'}"
+            elif kind == "PullRequestReview" and item.get("state") in GH_REVIEW_VERBS:
+                text = f"#{iid} {actor} {GH_REVIEW_VERBS[item['state']]}" + (f": {truncate(body, 100)}" if body else "")
+            elif kind in ("PullRequestReview", "IssueComment") and body:
+                events.append({"id": f"gh:{item['id']}", "ts": ts, "kind": "comment",
+                               "text": f"#{iid} {actor}: {truncate(body, 100)}"})
+                continue
+            else:
+                continue
+            events.append({"id": f"gh:{item['id']}", "ts": ts, "kind": "github", "text": text})
+        return events
+
+    def username(self) -> str:
+        name = login(self.api("user"), "login")
+        if not name:
+            raise FlowError("gh: `user` returned no login", EXIT_PRECONDITION)
+        return name
+
+    def mr_create(self, branch: str, base: str, title: str) -> int:
+        out = self._run(["pr", "create", "--draft", "--title", title, "--body", "", "--head", branch,
+                         "--base", base]) or ""
+        printed = re.search(r"/pull/(\d+)", out)  # gh prints the new PR's URL
+        if printed:
+            return int(printed.group(1))
+        created = self.latest_mr_for_branch(branch)
+        if not created or created["state"] != "opened":
+            raise FlowError("gh: PR created but not found by head branch", EXIT_PRECONDITION)
+        return int(created["iid"])
+
+
+def nodes(connection: object) -> list[dict]:
+    """A GraphQL connection's `nodes`, tolerating null at every level."""
+    found = connection.get("nodes") if isinstance(connection, dict) else None
+    return [n for n in (found or []) if isinstance(n, dict)]
+
+
+def make_forge(repo: Repo) -> Forge:
+    return {"gitlab": Glab, "github": Gh}[repo.forge_name](repo.root)
 
 
 def quote(value: str) -> str:
@@ -462,20 +773,20 @@ class MrFacts:
     label: str
 
 
-def mr_facts(iid: int | None, entry: dict | None, asked: bool) -> MrFacts:
+def mr_facts(iid: int | None, entry: dict | None, asked: bool, prefix: str = "!") -> MrFacts:
     if iid is None:
         return MrFacts(None, "none", False, "", "-")
     if entry is None:
-        return MrFacts(iid, "unknown", False, "", f"!{iid}{'?' if asked else ''}")
+        return MrFacts(iid, "unknown", False, "", f"{prefix}{iid}{'?' if asked else ''}")
     state, draft = str(entry.get("state", "?")), bool(entry.get("draft"))
-    return MrFacts(iid, state, draft, str(entry.get("web_url") or ""), f"!{iid}:{state}{'D' if draft else ''}")
+    return MrFacts(iid, state, draft, str(entry.get("web_url") or ""), f"{prefix}{iid}:{state}{'D' if draft else ''}")
 
 
 # --------------------------------------------------------------------------- forge cache and derivation
 
 
 class ForgeCache:
-    """GitLab's answers, kept so the offline hook can derive stage and ball without the network.
+    """The forge's answers, kept so the offline hook can derive stage and ball without the network.
 
     One file for the primary and all worktrees (it lives under the shared `local-docs/`), written by replacing it
     whole, so a concurrent reader sees either the old or the new version.
@@ -509,7 +820,7 @@ class ForgeCache:
         return time.time() - float(self.data["fetched_at"]) if self.synced else None
 
     def iid_for(self, meta: dict) -> int | None:
-        """A stored `mr:` (branchless tasks) wins; otherwise the MR GitLab has for the task's branch."""
+        """A stored `mr:` (branchless tasks) wins; otherwise the MR the forge has for the task's branch."""
         if meta.get("mr"):
             return int(meta["mr"])
         found = self.data["by_branch"].get(meta.get("branch") or "")
@@ -525,63 +836,11 @@ class ForgeCache:
         os.replace(tmp, self.path)
 
 
-def mr_entry(data: dict) -> dict:
-    author = data.get("author")
-    return {
-        "state": str(data.get("state", "?")), "draft": bool(data.get("draft")),
-        "author": str(author.get("username", "")) if isinstance(author, dict) else "",
-        "source_branch": str(data.get("source_branch") or ""), "sha": str(data.get("sha") or ""),
-        "merge_status": str(data.get("detailed_merge_status") or ""), "web_url": str(data.get("web_url") or ""),
-        "merged_at": str(data.get("merged_at") or "")[:10], "approvals": 0, "threads": [],
-        "created_at": str(data.get("created_at") or ""), "merged_at_full": str(data.get("merged_at") or ""),
-        "events": [],
-    }
-
-
 def iso_ts(value: str) -> int | None:
     try:
         return int(dt.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except ValueError:
         return None
-
-
-def forge_events(iid: int, entry: dict, discussions: list) -> list[dict]:
-    """Journal lines GitLab knows and git does not: MR lifecycle, review requests, approvals, human comments."""
-    events = []
-    for kind, at in (("mr-created", entry.get("created_at")), ("mr-merged", entry.get("merged_at_full"))):
-        ts = iso_ts(at or "")
-        if ts:
-            events.append({"id": f"gl:!{iid}:{kind}", "ts": ts, "kind": kind, "text": f"!{iid}"})
-    for discussion in discussions:
-        for note in discussion.get("notes") or []:
-            if not isinstance(note, dict) or not note.get("id"):
-                continue
-            ts = iso_ts(str(note.get("created_at") or ""))
-            author = (note.get("author") or {}).get("username", "?")
-            body = " ".join(str(note.get("body") or "").replace("**", "").split())
-            if note.get("system"):
-                if ts and JOURNAL_SYSTEM_NOTES.match(body):
-                    events.append({"id": f"gl:{note['id']}", "ts": ts, "kind": "gitlab",
-                                   "text": f"!{iid} {author} {truncate(body, 100)}"})
-            elif ts:
-                events.append({"id": f"gl:{note['id']}", "ts": ts, "kind": "comment",
-                               "text": f"!{iid} {author}: {truncate(body, 100)}"})
-    return events
-
-
-def threads_of(discussions: list) -> list[dict]:
-    """Resolvable review threads only: a plain comment carries no obligation that a reply discharges."""
-    threads = []
-    for discussion in discussions:
-        notes = [n for n in (discussion.get("notes") or []) if isinstance(n, dict) and not n.get("system")]
-        resolvable = [n for n in notes if n.get("resolvable")]
-        if not resolvable:
-            continue
-        author = notes[-1].get("author")
-        threads.append({"resolved": all(n.get("resolved") for n in resolvable),
-                        "last_author": str(author.get("username", "")) if isinstance(author, dict) else "",
-                        "last_note_id": int(notes[-1].get("id") or 0)})
-    return threads
 
 
 def parallel(calls: list) -> list:
@@ -592,11 +851,13 @@ def parallel(calls: list) -> list:
         return list(pool.map(lambda call: call(), calls))
 
 
-def sync(repo: Repo, metas: list[dict], cache: ForgeCache, forge: Glab, prune: bool) -> None:
-    """Ask GitLab about every task's MR and store the answers; `prune` also drops MRs no task refers to any more.
+def sync(repo: Repo, metas: list[dict], cache: ForgeCache, forge: Forge, prune: bool) -> None:
+    """Ask the forge about every task's MR and store the answers; `prune` also drops MRs no task refers to any more.
 
     Two parallel rounds: every lookup that needs nothing but the task file, then the detail of each MR found.
     """
+    if cache.data.get("forge") not in (None, forge.name):  # origin moved to another forge: its iids mean nothing here
+        cache.data = ForgeCache.from_data({}).data
     live = [m for m in metas if m["stage"] != "cleaned"]
     branches = sorted({m["branch"] for m in live if m["branch"]})  # even with a stored `mr`: doctor compares
     stored = sorted({int(m["mr"]) for m in live if m.get("mr")})
@@ -608,7 +869,7 @@ def sync(repo: Repo, metas: list[dict], cache: ForgeCache, forge: Glab, prune: b
     found = dict(zip(lookups, parallel(list(lookups.values()))))
     if "me" in found:
         cache.data["me"] = found["me"]
-    raw: dict[int, dict] = dict(found.get("stored") or {})
+    raw: dict[int, dict] = dict(found.get("stored") or {})  # normalized MRs, each still carrying its `iid`
     by_branch = {} if prune else dict(cache.data["by_branch"])
     for branch in branches:
         by_branch.pop(branch, None)
@@ -616,27 +877,24 @@ def sync(repo: Repo, metas: list[dict], cache: ForgeCache, forge: Glab, prune: b
         if data:
             by_branch[branch] = int(data["iid"])
             raw[int(data["iid"])] = data
-    entries = {iid: mr_entry(data) for iid, data in raw.items()}
+    entries = {iid: {k: v for k, v in data.items() if k != "iid"} for iid, data in raw.items()}
     known = cache.data["mrs"]
     # An open MR changes all the time; a closed or merged one is read once more when it settles, then kept.
     wanted = {iid: entry["state"] == "opened" for iid, entry in entries.items()
               if entry["state"] == "opened" or known.get(str(iid), {}).get("state") != entry["state"]}
-    details = dict(zip(wanted, parallel([
-        (lambda i=i: (forge.mr_approvals(i), forge.discussions(i))) if is_open else (lambda i=i: (0, forge.discussions(i)))
-        for i, is_open in wanted.items()])))
+    details = dict(zip(wanted, parallel([lambda i=i, o=is_open: forge.details(i, entries[i], o)
+                                         for i, is_open in wanted.items()])))
     for iid, entry in entries.items():
         if iid in details:
-            approvals, discussions = details[iid]
-            entry.update(approvals=approvals, threads=threads_of(discussions),
-                         events=forge_events(iid, entry, discussions))
+            entry.update(details[iid])
         else:
             entry["events"] = known.get(str(iid), {}).get("events", [])
     mrs = {} if prune else dict(known)
     mrs.update({str(iid): entry for iid, entry in entries.items()})
     for iid in stored:
         if iid not in raw:
-            mrs.pop(str(iid), None)  # asked, and GitLab has no such MR: unknown, not stale
-    cache.data.update(fetched_at=time.time(), by_branch=by_branch, mrs=mrs)
+            mrs.pop(str(iid), None)  # asked, and the forge has no such MR: unknown, not stale
+    cache.data.update(forge=forge.name, fetched_at=time.time(), by_branch=by_branch, mrs=mrs)
     cache.save()
 
 
@@ -673,7 +931,7 @@ class Derived:
     stage: str
     ball: str
     iid: int | None
-    entry: dict | None  # the cached MR, if GitLab has been asked about it
+    entry: dict | None  # the cached MR, if the forge has been asked about it
     stage_source: Literal["stored", "forge"]
     ball_source: Literal["derived", "pin"]
     closed: bool  # the MR was closed unmerged: the stage falls back to the file's
@@ -682,7 +940,7 @@ class Derived:
 
 
 def derive(meta: dict, cache: ForgeCache, approvals_required: int) -> Derived:
-    """Effective stage and ball: the MR decides forge stages, the file keeps only what GitLab cannot know."""
+    """Effective stage and ball: the MR decides forge stages, the file keeps only what the forge cannot know."""
     stored = meta["stage"]
     iid = cache.iid_for(meta)
     entry = cache.mr(iid)
@@ -896,7 +1154,7 @@ def load_tasks(repo: Repo) -> list[dict]:
     return metas
 
 
-def status_rows(repo: Repo, brief: bool, cache: ForgeCache, forge: Glab | None) -> list[dict]:
+def status_rows(repo: Repo, brief: bool, cache: ForgeCache, forge: Forge | None) -> list[dict]:
     """The row model behind every renderer; `forge=None` reads the cache only (offline, and the hook)."""
     metas = load_tasks(repo)
     if forge is not None:
@@ -917,7 +1175,7 @@ def status_rows(repo: Repo, brief: bool, cache: ForgeCache, forge: Glab | None) 
 
 def status_row(repo: Repo, meta: dict, d: Derived, cache: ForgeCache, current: str | None) -> dict:
     """One task's row. Its keys are the `--json` contract; `board` and the tests read them by name."""
-    mr = mr_facts(d.iid, d.entry, asked=cache.synced)
+    mr = mr_facts(d.iid, d.entry, asked=cache.synced, prefix=repo.words.prefix)
     ab = branch_ab(repo, meta["branch"]) if meta["branch"] else ""
     journal = read_events(events_path(repo, meta["key"]))  # a file read: git is journaled by sync, log and clean
     return {
@@ -982,7 +1240,7 @@ PLAN_SNAPSHOT_BEGIN, PLAN_SNAPSHOT_END = "<!-- plan:snapshot:begin -->", "<!-- p
 
 
 def hook_context(repo: Repo, rows: list[dict], cache: ForgeCache) -> str:
-    table = render_table(rows) + hook_extras(rows) + render_overlaps(repo, rows) + cache_line(repo, cache)
+    table = render_table(rows) + hook_extras(repo, rows) + render_overlaps(repo, rows) + cache_line(repo, cache)
     return (
         f"flow status ({repo.primary.name}, * = current branch). Task files: {repo.tasks_dir}\n{table}\n"
         "flow commands — agent: `flow note \"...\" [KEY] --next \"...\"`, `flow next [KEY]`, "
@@ -1008,7 +1266,7 @@ def write_snapshot(path: Path, md: str) -> None:
 
 def cmd_status(repo: Repo, args: argparse.Namespace) -> int:
     cache = ForgeCache(repo)
-    forge = None if (args.hook or args.offline) else Glab(repo.root)
+    forge = None if (args.hook or args.offline) else make_forge(repo)
     rows = status_rows(repo, brief=args.brief or args.hook, cache=cache, forge=forge)
     if args.hook:
         if rows:
@@ -1050,7 +1308,7 @@ def write_html(repo: Repo, rows: list[dict], out: str | None, open_browser: bool
 
 def cmd_board(repo: Repo, args: argparse.Namespace) -> int:
     """`flow board` = `flow status --html --open`: regenerate (a stale board lies) and open."""
-    rows = status_rows(repo, brief=False, cache=ForgeCache(repo), forge=None if args.offline else Glab(repo.root))
+    rows = status_rows(repo, brief=False, cache=ForgeCache(repo), forge=None if args.offline else make_forge(repo))
     write_html(repo, rows, out=None, open_browser=True)
     return 0
 
@@ -1202,14 +1460,15 @@ def is_ancestor(repo: Repo, older: str, newer: str) -> bool:
     return git_ok("merge-base", "--is-ancestor", older, newer, cwd=repo.primary)
 
 
-def hook_extras(rows: list[dict]) -> str:
+def hook_extras(repo: Repo, rows: list[dict]) -> str:
     """What the table truncates or leaves implicit: the current task's full `next`, and commands only a human runs."""
     extras = []
     for row in rows:
         if row["current"] and len(str(row["next"])) > NEXT_WIDTH:
             extras.append(f"* {row['key']} next (full): {row['next']}")
     human = [f"flow clean {row['key']}" for row in rows if row["stage"] == "merged"]
-    human += [f"un-draft !{row['mr_iid']} ({row['key']}) in GitLab" for row in rows
+    w = repo.words
+    human += [f"un-draft {w.prefix}{row['mr_iid']} ({row['key']}) in {w.product}" for row in rows
               if row["mr_draft"] and row["mr_mine"] and row["mr_state"] == "opened"]
     if human:
         extras.append("for the human (own terminal): " + "; ".join(human))
@@ -1290,7 +1549,7 @@ def require_settled(cwd: Path) -> None:
 
 
 def warn_base_conflicts(repo: Repo, cwd: Path) -> None:
-    """Conflicts with the base do not block review -- GitLab reviews a conflicted MR -- but say so up front."""
+    """Conflicts with the base do not block review -- both forges review a conflicted MR -- but say so up front."""
     base = repo.base_ref
     result = run(["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", base, "HEAD"], cwd)
     if result.returncode == 1:
@@ -1299,7 +1558,7 @@ def warn_base_conflicts(repo: Repo, cwd: Path) -> None:
              "the MR will show conflicts until you rebase")
 
 
-def to_review(repo: Repo, meta: dict, no_gate: bool, forge: Glab, cache: ForgeCache) -> None:
+def to_review(repo: Repo, meta: dict, no_gate: bool, forge: Forge, cache: ForgeCache) -> None:
     """Gate, push, and an MR: the cache was synced for this task just before, so it already knows an open one."""
     branch = meta["branch"] or git("branch", "--show-current", cwd=repo.resolve_worktree(meta), check=False)
     if not branch:
@@ -1316,14 +1575,15 @@ def to_review(repo: Repo, meta: dict, no_gate: bool, forge: Glab, cache: ForgeCa
     require_pushed(repo, cwd, branch)
     existing = cache.mr(cache.data["by_branch"].get(branch))
     if existing and existing["state"] == "opened":
-        print(f"found open MR !{cache.data['by_branch'][branch]}")
+        print(f"found open {repo.words.noun} {repo.words.prefix}{cache.data['by_branch'][branch]}")
     else:
         title = f"{meta['key']}: {meta['title'] or branch}"
-        print(f"created Draft MR !{forge.mr_create(branch, repo.base_branch, title)}: {title}")
+        w = repo.words
+        print(f"created Draft {w.noun} {w.prefix}{forge.mr_create(branch, repo.base_branch, title)}: {title}")
 
 
 def cmd_next(repo: Repo, args: argparse.Namespace) -> int:
-    """Advance what the task file owns; for everything after the MR, act and then report what GitLab says."""
+    """Advance what the task file owns; for everything after the MR, act and then report what the forge says."""
     if args.no_gate != bool(args.why):
         raise FlowError("--no-gate needs --why \"...\" (and --why needs --no-gate): a skipped gate leaves its reason "
                         "in the task notes", EXIT_PRECONDITION)
@@ -1341,13 +1601,15 @@ def cmd_next(repo: Repo, args: argparse.Namespace) -> int:
         save_task(path, meta, body)
         print(f"{key}: {stored} → {meta['stage']}")
         return 0
-    forge = Glab(repo.root)
+    forge = make_forge(repo)
     sync(repo, [meta], cache, forge, prune=False)
     before = derive(meta, cache, repo.approvals_required)
     if before.stage == "merged":
         raise FlowError("merged → cleaned goes through `flow clean`", EXIT_PRECONDITION)
     if before.closed:
-        raise FlowError(f"!{before.iid} is closed; open a new MR (`flow next` from test) or park", EXIT_PRECONDITION)
+        w = repo.words
+        raise FlowError(f"{w.prefix}{before.iid} is closed; open a new {w.noun} (`flow next` from test) or park",
+                        EXIT_PRECONDITION)
     if before.stage in ("test", "changes"):
         to_review(repo, meta, args.no_gate, forge, cache)
         if why:  # only once the review really went out: a skip that stopped short of it skipped nothing
@@ -1363,11 +1625,11 @@ def cmd_next(repo: Repo, args: argparse.Namespace) -> int:
 
 
 def cmd_sync(repo: Repo, args: argparse.Namespace) -> int:
-    """Refresh the forge cache, then journal every task from git and the fresh GitLab facts."""
+    """Refresh the forge cache, then journal every task from git and the fresh forge facts."""
     cache = ForgeCache(repo)
     try:
         tasks = load_tasks(repo)
-        sync(repo, tasks, cache, Glab(repo.root), prune=True)
+        sync(repo, tasks, cache, make_forge(repo), prune=True)
         for meta in tasks:
             collect_events(repo, meta, cache)
     finally:
@@ -1438,7 +1700,7 @@ def cmd_start(repo: Repo, args: argparse.Namespace) -> int:
 def commits_only_here(repo: Repo, branch: str, mr_sha: str | None) -> list[str]:
     """Commits `branch -D` would destroy: reachable from no remote-tracking ref and not from the MR's head.
 
-    The MR head counts because GitLab deletes the source branch on merge and may squash, so after a merge the
+    The MR head counts because the forge may delete the source branch on merge and may squash, so after a merge the
     branch's commits can legitimately be on no remote at all.
     """
     git("fetch", "--quiet", "origin", cwd=repo.primary, check=False)
@@ -1450,8 +1712,8 @@ def commits_only_here(repo: Repo, branch: str, mr_sha: str | None) -> list[str]:
 
 
 def prove_merged(repo: Repo, meta: dict) -> str | None:
-    """The merged MR's head sha; refuses when GitLab cannot show the task's MR as merged."""
-    forge = Glab(repo.root)
+    """The merged MR's head sha; refuses when the forge cannot show the task's MR as merged."""
+    forge = make_forge(repo)
     if meta.get("mr"):
         data = forge.mr_view(int(meta["mr"]))
     else:
@@ -1459,7 +1721,7 @@ def prove_merged(repo: Repo, meta: dict) -> str | None:
     if not data:
         raise FlowError("no MR found for the task — cannot prove it merged; use --force-unmerged", EXIT_PRECONDITION)
     if data.get("state") != "merged":
-        raise FlowError(f"!{data.get('iid')} is {data.get('state')}, not merged; refuse to clean "
+        raise FlowError(f"{repo.words.prefix}{data.get('iid')} is {data.get('state')}, not merged; refuse to clean "
                         "(--force-unmerged to override)", EXIT_PRECONDITION)
     return data.get("sha")
 
@@ -1533,7 +1795,7 @@ def cmd_clean(repo: Repo, args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- doctor
 
 
-def consistency_problems(meta: dict, d: Derived, cache: ForgeCache) -> list[str]:
+def consistency_problems(meta: dict, d: Derived, cache: ForgeCache, w: ForgeWords) -> list[str]:
     """What the derivation cannot settle on its own, so a human or the agent has to."""
     problems = []
     if meta["stage"] in FORGE_STAGES or meta.get("ball") is not None:
@@ -1543,11 +1805,12 @@ def consistency_problems(meta: dict, d: Derived, cache: ForgeCache) -> list[str]
         problems.append(f"ball pinned to {pin.get('value')} since {pin.get('since')} ({pin.get('why')}), "
                         "but the MR moved since -- re-pin or `flow set ball auto`")
     if d.closed:
-        problems.append(f"!{d.iid} is closed -- open a new MR (`flow next` from test) or park")
+        problems.append(f"{w.prefix}{d.iid} is closed -- open a new {w.noun} (`flow next` from test) or park")
     branch_iid = cache.data["by_branch"].get(meta["branch"]) if meta["branch"] else None
     if meta.get("mr") and meta["branch"]:
-        problems.append(f"stores mr !{meta['mr']} although it has branch {meta['branch']}"
-                        + (f" (whose MR is !{branch_iid})" if branch_iid and branch_iid != meta["mr"] else "")
+        problems.append(f"stores mr {w.prefix}{meta['mr']} although it has branch {meta['branch']}"
+                        + (f" (whose {w.noun} is {w.prefix}{branch_iid})" if branch_iid and branch_iid != meta["mr"]
+                           else "")
                         + " -- `flow migrate`")
     if d.stage == "merged":
         merged_on = (d.entry or {}).get("merged_at") or str(meta["updated"])
@@ -1566,8 +1829,9 @@ def cmd_doctor(repo: Repo, args: argparse.Namespace) -> int:
     cache = ForgeCache(repo)
     if not args.offline:
         try:
-            sync(repo, list(tasks.values()), cache, Glab(repo.root), prune=True)
-            print("glab: ok")
+            forge = make_forge(repo)
+            sync(repo, list(tasks.values()), cache, forge, prune=True)
+            print(f"{forge.cli}: ok")
         except FlowError as error:
             print(f"{error} -- checks below use the cache")
     derived = {key: derive(meta, cache, repo.approvals_required) for key, meta in tasks.items()}
@@ -1612,7 +1876,7 @@ def cmd_doctor(repo: Repo, args: argparse.Namespace) -> int:
             rel = os.path.relpath(held, repo.primary) if held != repo.primary else "''"
             print(f"{key}: {meta['branch']} is checked out in {held}, task says {meta['worktree'] or 'primary'} "
                   f"(flow set worktree {rel} {key})")
-        for problem in consistency_problems(meta, derived[key], cache):
+        for problem in consistency_problems(meta, derived[key], cache, repo.words):
             problems += 1
             print(f"{key}: {problem}")
     print(f"{problems} problem(s)" if problems else "ok")
@@ -1625,7 +1889,7 @@ def cmd_doctor(repo: Repo, args: argparse.Namespace) -> int:
 def migrate_meta(meta: dict, cache: ForgeCache, approvals_required: int) -> tuple[dict, str | None]:
     """The task file with every derivable field removed, plus advice when a stored ball disagrees with the MR.
 
-    A disagreeing ball is pinned only where GitLab has no evidence (no MR): there the stored value is the only
+    A disagreeing ball is pinned only where the forge has no evidence (no MR): there the stored value is the only
     knowledge there is. Where an MR exists, the stored ball is what drifted, so it is dropped and the human is told
     how to re-pin it deliberately -- pinning it wholesale would preserve exactly the drift migration removes.
     """
@@ -1760,11 +2024,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default local-docs/PLAN.local.md)")
     p.add_argument("--out", help="with --html: output path")
     p.add_argument("--open", action="store_true", help="with --html: open in the browser")
-    p.add_argument("--offline", action="store_true", help="skip glab")
+    p.add_argument("--offline", action="store_true", help="skip the forge")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("board", help="regenerate the kanban board and open it (= status --html --open)")
-    p.add_argument("--offline", action="store_true", help="skip glab")
+    p.add_argument("--offline", action="store_true", help="skip the forge")
     p.set_defaults(func=cmd_board)
 
     p = sub.add_parser("start", help="[human] worktree + branch + task file")
@@ -1805,12 +2069,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--offline", action="store_true")
     p.set_defaults(func=cmd_doctor)
 
-    p = sub.add_parser("log", help="task journal: git reflog + GitLab events + hand-written notes, by time")
+    p = sub.add_parser("log", help="task journal: git reflog + forge events + hand-written notes, by time")
     p.add_argument("key", nargs="?")
     p.add_argument("--since", help="YYYY-MM-DD")
     p.set_defaults(func=cmd_log)
 
-    p = sub.add_parser("sync", help="ask GitLab about every task's MR and refresh the forge cache")
+    p = sub.add_parser("sync", help="ask the forge about every task's MR and refresh the forge cache")
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(func=cmd_sync)
 

@@ -90,7 +90,7 @@ def env(tmp_path: Path) -> dict:
     g("push", "-q", "-u", "origin", "main")
     g("remote", "set-head", "origin", "main")
     (primary / "local-docs").mkdir()
-    (primary / "local-docs" / "flow.local.yml").write_text('gate: "true"\n')
+    (primary / "local-docs" / "flow.local.yml").write_text('gate: "true"\nforge: gitlab\n')
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     glab = bin_dir / "glab"
@@ -382,7 +382,7 @@ def test_next_from_test_creates_draft_mr(env: dict) -> None:
 
 
 def test_failing_gate_blocks_review(env: dict) -> None:
-    (env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "false"\n')
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\ngate: "false"\n')
     wt = start(env)
     to_test_stage(env, wt)
     push(wt)
@@ -398,7 +398,7 @@ def test_failing_gate_blocks_review(env: dict) -> None:
 
 
 def test_skip_reason_is_not_noted_when_review_stops_short(env: dict) -> None:
-    (env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "false"\n')
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\ngate: "false"\n')
     wt = start(env)
     to_test_stage(env, wt)  # not pushed: to_review refuses after the skipped gate
     result = flow(env, "next", "--no-gate", "--why", "never reached review", cwd=wt)
@@ -608,13 +608,13 @@ def test_bad_user_input_is_a_flow_error_not_a_traceback(env: dict) -> None:
         assert result.returncode == 1 and "Traceback" not in result.stderr, value
         assert "mr must be" in result.stderr or "must be positive" in result.stderr
     assert read_meta(env, "PL-7")["mr"] is None
-    (env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "echo {nope}"\n')
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\ngate: "echo {nope}"\n')
     for _ in range(3):
         flow(env, "next", "PL-7", check=True)  # plan -> refine -> implement -> test
     result = flow(env, "next", "PL-7")
     assert result.returncode == 1 and "bad placeholder" in result.stderr and "{base}" in result.stderr
     assert "Traceback" not in result.stderr
-    (env["primary"] / "local-docs" / "flow.local.yml").write_text('worktree_dir: "../wt-{0}"\n')
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\nworktree_dir: "../wt-{0}"\n')
     result = flow(env, "start", "PL-8", "bad-template", human=True)
     assert result.returncode == 1 and "worktree_dir" in result.stderr and "Traceback" not in result.stderr
     result = flow(env, "status", "--md", "--json", "--offline")
@@ -646,7 +646,7 @@ def test_flow_today_overrides_the_clock(env: dict) -> None:
 
 def test_approvals_required_is_configurable(env: dict) -> None:
     start(env)
-    (env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "true"\napprovals_required: 2\n')
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\ngate: "true"\napprovals_required: 2\n')
     mr(env, approvals=1)
     assert stage_ball(env) == ("review-wait", "them")  # one of two: the second reviewer owes an approval
     mr(env, approvals=2)
@@ -788,7 +788,7 @@ def test_overlap_ignore_drops_files_whose_sharing_is_not_a_conflict(env: dict) -
     commit(first, ".metrics/ci.jsonl")
     commit(second, ".metrics/ci.jsonl", "y\n")
     assert overlaps(env) == ["PL-7 <-> PL-8: both change .metrics/ci.jsonl"]
-    (env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "true"\noverlap_ignore: [".metrics/*"]\n')
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\ngate: "true"\noverlap_ignore: [".metrics/*"]\n')
     assert overlaps(env) == []
 
 
@@ -853,7 +853,7 @@ def test_next_refuses_when_the_branch_is_gone_from_origin_despite_a_stale_tracki
 
 def test_next_runs_the_gate_where_the_branch_is_checked_out_not_where_the_task_says(env: dict) -> None:
     (env["primary"] / "local-docs" / "flow.local.yml").write_text(
-        'gate: test "$(git branch --show-current)" = PL-7-smoke\n')
+        'forge: gitlab\ngate: test "$(git branch --show-current)" = PL-7-smoke\n')
     wt = start(env)
     to_test_stage(env, wt)
     push(wt)
@@ -1190,3 +1190,215 @@ def test_install_hook_leaves_invalid_json_untouched(tmp_path: Path) -> None:
     result = _run_setup("install-hook", "--settings", str(settings))
     assert result.returncode != 0 and "not valid JSON" in result.stderr
     assert settings.read_text() == "{not json"
+
+
+# --------------------------------------------------------------------------- GitHub backend (fake `gh`)
+
+FAKE_GH = r'''#!/usr/bin/env python3
+import json, os, re, sys
+state_path = os.environ["FAKE_GLAB_STATE"]
+state = json.load(open(state_path))
+if state.get("offline"):
+    sys.stderr.write("error connecting to api.github.com\n"); sys.exit(1)
+prs = state.setdefault("prs", {})
+args = sys.argv[1:]
+def rest(num, pr):
+    merged = pr.get("state") == "merged"
+    return {"number": int(num), "state": "open" if pr.get("state", "open") == "open" else "closed",
+            "merged_at": "2026-09-20T10:00:00Z" if merged else None, "draft": pr.get("draft", False),
+            "user": {"login": pr.get("author", "me")}, "head": {"ref": pr["head"], "sha": pr.get("sha", "abc")},
+            "html_url": "https://github.example/o/r/pull/" + str(num),
+            "created_at": pr.get("created_at", "2026-09-19T09:00:00Z"), "mergeable_state": "unknown"}
+if args[0] == "api":
+    path = args[1]
+    with open(state_path + ".calls", "a") as log:
+        log.write(path + "\n")
+    if path == "user":
+        print(json.dumps({"login": state.get("me", "me")})); sys.exit(0)
+    if path == "graphql":
+        fields = dict(a.split("=", 1) for a in args[2:] if "=" in a and not a.startswith("query="))
+        assert fields["owner"] == "{owner}" and fields["repo"] == "{repo}", fields
+        pr = prs.get(fields["number"])
+        if pr is None:
+            print(json.dumps({"data": {"repository": {"pullRequest": None}}})); sys.exit(0)
+        print(json.dumps({"data": {"repository": {"pullRequest": {
+            "isDraft": pr.get("draft", False), "mergeStateStatus": pr.get("merge", "CLEAN"),
+            "commits": {"nodes": [{"commit": {"committedDate": pr.get("pushed_at", "2026-09-19T09:00:00Z")}}]},
+            "latestReviews": {"nodes": pr.get("reviews", [])},
+            "reviewThreads": {"nodes": pr.get("threads", [])},
+            "timelineItems": {"nodes": pr.get("timeline", [])}}}}})); sys.exit(0)
+    assert path.startswith("repos/{owner}/{repo}/pulls"), path
+    m = re.match(r"repos/\{owner\}/\{repo\}/pulls/(\d+)$", path)
+    if m:
+        if m.group(1) not in prs:
+            sys.stderr.write("gh: Not Found (HTTP 404)\n"); sys.exit(1)
+        print(json.dumps(rest(m.group(1), prs[m.group(1)]))); sys.exit(0)
+    m = re.match(r"repos/\{owner\}/\{repo\}/pulls\?head=\{owner\}:([^&]+)&state=all", path)
+    if m:
+        from urllib.parse import unquote
+        out = [rest(n, pr) for n, pr in sorted(prs.items(), key=lambda kv: -int(kv[0]))
+               if pr["head"] == unquote(m.group(1))]
+        print(json.dumps(out)); sys.exit(0)
+    sys.stderr.write("unknown api path " + path + "\n"); sys.exit(1)
+if args[:2] == ["pr", "create"]:
+    head, base = args[args.index("--head") + 1], args[args.index("--base") + 1]
+    assert "--draft" in args and base == "main", args
+    num = str(max([int(n) for n in prs] + [0]) + 1)
+    prs[num] = {"head": head, "draft": True}
+    json.dump(state, open(state_path, "w"))
+    print("https://github.example/o/r/pull/" + num); sys.exit(0)
+sys.stderr.write("unsupported: " + " ".join(args) + "\n"); sys.exit(1)
+'''
+
+
+@pytest.fixture()
+def gh_env(env: dict) -> dict:
+    gh = env["tmp"] / "bin" / "gh"
+    gh.write_text(FAKE_GH)
+    gh.chmod(0o755)
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "true"\nforge: github\n')
+    return env
+
+
+def pr(env: dict, num: str = "5", head: str = "PL-7-smoke", **fields) -> None:
+    data = json.loads(env["state"].read_text())
+    data.setdefault("prs", {})[num] = {"head": head, **fields}
+    env["state"].write_text(json.dumps(data))
+
+
+def gh_thread(*authors: str, resolved: bool = False, first_id: int = 1) -> dict:
+    return {"isResolved": resolved,
+            "comments": {"nodes": [{"databaseId": first_id + len(authors) - 1, "author": {"login": authors[-1]}}]}}
+
+
+def gh_review(who: str, state: str, at: str = "2026-09-20T10:00:00Z", review_id: int = 900) -> dict:
+    return {"databaseId": review_id, "state": state, "submittedAt": at, "author": {"login": who}}
+
+
+def test_github_stage_and_ball_follow_the_pr_when_i_am_the_author(gh_env: dict) -> None:
+    start(gh_env)
+    pr(gh_env)
+    assert stage_ball(gh_env) == ("review-wait", "them")
+    assert row(gh_env)["mr"] == "#5:opened"
+    pr(gh_env, threads=[gh_thread("rev")])
+    assert stage_ball(gh_env) == ("changes", "me")
+    pr(gh_env, threads=[gh_thread("rev", "me")])
+    assert stage_ball(gh_env) == ("review-wait", "them")
+    pr(gh_env, threads=[gh_thread("rev", resolved=True)], reviews=[gh_review("rev", "APPROVED")])
+    assert stage_ball(gh_env) == ("merge-wait", "them")
+    pr(gh_env, reviews=[gh_review("rev", "APPROVED")], merge="BLOCKED")
+    assert stage_ball(gh_env) == ("changes", "me")  # approved, but GitHub will not merge it yet
+    pr(gh_env, draft=True)
+    assert stage_ball(gh_env) == ("review-wait", "me")  # my draft: I un-draft
+    pr(gh_env, state="merged")
+    assert stage_ball(gh_env) == ("merged", "me")
+
+
+def test_github_changes_requested_is_a_thread_the_author_answers_by_pushing(gh_env: dict) -> None:
+    start(gh_env)
+    cr = [gh_review("rev", "CHANGES_REQUESTED", at="2026-09-20T10:00:00Z")]
+    pr(gh_env, reviews=cr, pushed_at="2026-09-19T09:00:00Z")
+    assert stage_ball(gh_env) == ("changes", "me")
+    pr(gh_env, reviews=cr, pushed_at="2026-09-21T09:00:00Z")
+    assert stage_ball(gh_env) == ("review-wait", "them")  # pushed after the verdict: the re-review is owed
+    other = {"author": "someone"}
+    pr(gh_env, reviews=[gh_review("me", "CHANGES_REQUESTED")], pushed_at="2026-09-19T09:00:00Z", **other)
+    assert stage_ball(gh_env) == ("review-wait", "them")  # I requested the changes on their PR
+
+
+def test_github_next_from_test_creates_a_draft_pr(gh_env: dict) -> None:
+    wt = start(gh_env)
+    to_test_stage(gh_env, wt)
+    push(wt)
+    result = flow(gh_env, "next", cwd=wt, check=True)
+    assert "created Draft PR #1" in result.stdout
+    assert stage_ball(gh_env) == ("review-wait", "me")
+    assert "un-draft #1 (PL-7) in GitHub" in hook_context(gh_env)
+
+
+def test_github_clean_proves_the_merge_through_the_pr(gh_env: dict) -> None:
+    wt = start(gh_env)
+    pr(gh_env, "9", state="closed")
+    result = flow(gh_env, "clean", "PL-7", human=True)
+    assert result.returncode == 2 and "#9 is closed, not merged" in result.stderr
+    pr(gh_env, "9", state="merged")
+    flow(gh_env, "clean", "PL-7", human=True, check=True)
+    assert not wt.exists()
+
+
+def test_github_stored_prs_fan_out_and_a_missing_one_stays_a_question(gh_env: dict) -> None:
+    write_task(gh_env, "PL-1", mr=5)
+    write_task(gh_env, "PL-2", mr=6)
+    pr(gh_env, "5", head="elsewhere")
+    assert row(gh_env, "PL-1")["mr"] == "#5:opened"
+    assert row(gh_env, "PL-2")["mr"] == "#6?"
+
+
+def test_github_log_journals_the_timeline(gh_env: dict) -> None:
+    start(gh_env)
+    pr(gh_env, timeline=[
+        {"__typename": "ReviewRequestedEvent", "id": "E1", "createdAt": "2026-09-20T10:00:00Z",
+         "actor": {"login": "me"}, "requestedReviewer": {"login": "rev"}},
+        {"__typename": "PullRequestReview", "id": "E2", "submittedAt": "2026-09-20T11:00:00Z",
+         "state": "CHANGES_REQUESTED", "body": "rename x", "author": {"login": "rev"}},
+        {"__typename": "IssueComment", "id": "E3", "createdAt": "2026-09-20T12:00:00Z", "body": "done",
+         "author": {"login": "me"}},
+        {"__typename": "LabeledEvent", "id": "E4", "createdAt": "2026-09-20T12:30:00Z"},
+    ])
+    flow(gh_env, "sync", check=True)
+    out = flow(gh_env, "log", "PL-7", check=True).stdout
+    assert "#5 me requested review from rev" in out and "#5 rev requested changes: rename x" in out
+    assert "#5 me: done" in out and "mr-created" in out and "E4" not in out
+
+
+def test_gh_offline_warns_and_falls_back_to_the_cache(gh_env: dict) -> None:
+    start(gh_env)
+    pr(gh_env)
+    flow(gh_env, "sync", check=True)
+    data = json.loads(gh_env["state"].read_text())
+    gh_env["state"].write_text(json.dumps({**data, "offline": True}))
+    result = flow(gh_env, "status", check=True)
+    assert result.stderr.count("gh offline") == 1 and "from cache" in result.stderr
+    assert "#5:opened" in result.stdout
+
+
+def test_a_cache_written_by_another_forge_is_discarded(gh_env: dict) -> None:
+    start(gh_env)
+    (gh_env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "true"\nforge: gitlab\n')
+    mr(gh_env)
+    data = json.loads(gh_env["state"].read_text())
+    gh_env["state"].write_text(json.dumps({**data, "me": "gitlab-user"}))
+    flow(gh_env, "sync", check=True)
+    (gh_env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "true"\nforge: github\n')
+    gh_env["state"].write_text(json.dumps({**data, "me": "github-user"}))
+    flow(gh_env, "sync", check=True)
+    cache = json.loads((gh_env["primary"] / "local-docs" / ".flow-cache" / "forge.json").read_text())
+    assert cache["forge"] == "github" and cache["mrs"] == {} and cache["by_branch"] == {}
+    assert cache["me"] == "github-user"  # the other forge's account says nothing about who I am here
+    assert row(gh_env)["mr"] == "-"
+
+
+@pytest.mark.parametrize("url, host, forge", [
+    ("git@github.com:o/r.git", "github.com", "github"),
+    ("https://github.com/o/r", "github.com", "github"),
+    ("https://token@github.example.com/o/r.git", "github.example.com", "github"),
+    ("ssh://git@gitlab.example.com:2222/o/r.git", "gitlab.example.com", "gitlab"),
+    ("https://gitlab.flora.ltfs.tools/pub/ai/x.git", "gitlab.flora.ltfs.tools", "gitlab"),
+    ("git@git.company.io:o/r.git", "git.company.io", None),
+    ("/tmp/origin.git", "", None),
+])
+def test_forge_is_told_from_origin_host(url: str, host: str, forge: str | None) -> None:
+    mod = _flow_module()
+    assert mod.url_host(url) == host
+    assert mod.forge_for_host(host) == forge
+
+
+def test_undetectable_forge_fails_only_where_a_forge_is_called(env: dict) -> None:
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('gate: "true"\n')  # local-path origin, no `forge:`
+    write_task(env, "PL-1", mr=5)
+    assert flow(env, "status", "--offline", check=True).stdout.count("PL-1") == 1
+    assert hook_context(env)
+    result = flow(env, "sync")
+    assert result.returncode != 0 and "set `forge: gitlab` or `forge: github`" in result.stderr
+    (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: bitbucket\n')
+    assert "must be one of gitlab, github" in flow(env, "sync").stderr

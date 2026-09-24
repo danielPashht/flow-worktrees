@@ -3,13 +3,15 @@
 **AI agents start every session from zero and mix tasks up. `flow` hands the agent the state of every task before
 its first message.**
 
-Branch, worktree, pushed or not, MR, whose move it is, and the next action: the agent reads all of it in the session
-context instead of digging through git to find where it left off, and without a single network call, because the
-hook reads a local cache. The same table saves the human the morning archaeology when ten tickets are open at once.
+Branch, worktree, pushed or not, MR or PR, whose move it is, and the next action: the agent reads all of it in the
+session context instead of digging through git to find where it left off, and without a single network call,
+because the hook reads a local cache. The same table saves the human the morning archaeology when ten tickets are
+open at once.
 
-The task file holds only what git and GitLab don't know: the next action, blockers, "why" notes, and the local
-stage of work. The MR, the stage after it, and whose move it is are computed from GitLab, and commits, pushes, and
-review events are journalled automatically. A field nobody updated can't be wrong, because it isn't stored.
+The task file holds only what git and the forge don't know: the next action, blockers, "why" notes, and the local
+stage of work. The MR, the stage after it, and whose move it is are computed from GitLab or GitHub, and commits,
+pushes, and review events are journalled automatically. A field nobody updated can't be wrong, because it isn't
+stored.
 
 ```
   key     stage       ball branch                                  wt      mr          updated next
@@ -25,8 +27,10 @@ overlaps:
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/), git, and [`glab`](https://gitlab.com/gitlab-org/cli) authenticated for
-your GitLab.
+Requires [uv](https://docs.astral.sh/uv/), git, and the CLI of your forge, authenticated:
+[`gh`](https://cli.github.com) for GitHub (including Enterprise) or [`glab`](https://gitlab.com/gitlab-org/cli) for
+GitLab (including self-hosted). `flow` tells which from `origin`'s host; set `forge: github` or `forge: gitlab` in
+`local-docs/flow.local.yml` when the host names neither.
 
 ```bash
 uv tool install flow-worktrees          # from PyPI
@@ -49,12 +53,12 @@ Upgrade with `uv tool upgrade flow-worktrees`; remove with `uv tool uninstall fl
   own worktree, and the task file. Tasks don't interfere, and each can run in its own session.
 - **State from the first minute.** At session start the agent gets the table: stage, whose move it is, how far the
   branch has drifted from `main` and whether it is pushed, the MR, and what to do next. The hook stays offline: it
-  reads the GitLab cache and, if the cache is older than an hour, refreshes it in the background for next time.
-- **MR, stage, and ball come from GitLab.** The MR is found by branch; the stage after it and the ball follow from
-  its state and threads, whether you are the author or a reviewer. When the computed answer is wrong (you're waiting
+  reads the forge cache and, if the cache is older than an hour, refreshes it in the background for next time.
+- **MR, stage, and ball come from the forge.** The MR (PR on GitHub) is found by branch; the stage after it and the
+  ball follow from its state and threads, whether you are the author or a reviewer. When the computed answer is wrong (you're waiting
   on a chat reply), pin it with a reason, `flow set ball them --why "…"`, until the MR next moves.
 - **A journal without discipline.** `flow log` shows the task's timeline: commits, amends, rebases, and pushes from
-  the reflog; MR creation, review requests, approvals, and comments from GitLab; and your notes in between. Only
+  the reflog; MR creation, review requests, approvals, and comments from the forge; and your notes in between. Only
   the "why" is left to write by hand.
 - **Overlaps before they conflict.** Under the table, `overlaps:` lists tasks that `main` moved under (with the
   commit and the shared files), pairs of branches changing the same files, and stacked branches. Git only, offline.
@@ -77,7 +81,7 @@ cd ../myrepo-4801 && claude                                  # an agent session 
 
 flow note "found the cause in X" --next "fix X"   # agent: the why, and the next action
 flow next                                          # plan → refine → implement → test; from test: review + Draft MR
-flow status                                        # where every task is (online: also refreshes the GitLab cache)
+flow status                                        # where every task is (online: also refreshes the forge cache)
 flow log                                           # what happened to the current task
 flow clean PROJ-4801                               # human: after the merge, remove the worktree and branch
 ```
@@ -93,27 +97,34 @@ The full workflow, the rules that derive stage and ball, and the safeguards are 
 
 ## Configuration
 
-Optional, per repository, in `local-docs/flow.local.yml`: `gate` (the pre-review check; without it `flow next`
-from `test` requires `--no-gate --why "…"`), `base_branch`, `worktree_dir`, `jira_base`, `overlap_ignore`,
+Optional, per repository, in `local-docs/flow.local.yml`: `forge` (`gitlab` or `github`; default: told from
+`origin`'s host), `gate` (the pre-review check; without it `flow next` from `test` requires
+`--no-gate --why "…"`), `base_branch`, `worktree_dir`, `jira_base`, `overlap_ignore`,
 `approvals_required`. `flow --help` describes each.
 
 ## Limits
 
-- The forge is GitLab only, through `glab`; a GitHub backend would be a second class beside `Glab`.
+- Two forges: GitLab through `glab` and GitHub through `gh`. Bitbucket, Gitea and the rest would each be one
+  more adapter class.
+- On GitHub, "approvals" are each reviewer's latest APPROVED review, "threads" are review threads, and a
+  "changes requested" verdict counts as an open thread that the author answers by pushing after it; the re-review
+  is then owed. GitHub blocks the merge on unresolved threads only when branch protection requires conversation
+  resolution, while flow passes the ball on them either way.
+- A PR from a fork is not found by branch: flow looks up heads in the repository itself.
 - Task keys are Jira-style (`ABC-123`); this is not configurable.
 - The `local-docs/` directory name is fixed. If your repository already tracks a `local-docs/`, rename it first.
 - `local-docs/` is hidden through `.git/info/exclude` on the first `flow start`. A task file created by hand leaves
   the directory visible in `git status` until then.
-- Without GitLab access, transitions that need it refuse and say why; `flow status` shows cached stages and the
+- Without access to the forge, transitions that need it refuse and say why; `flow status` shows cached stages and the
   cache's age.
 - The ball follows resolvable threads. A plain comment outside a thread does not pass it; a bot's thread does,
-  because GitLab blocks the merge on it.
+  because the forge can block the merge on it.
 - The SessionStart hook may spawn a detached `flow sync`. `FLOW_BACKGROUND_SYNC=0` disables that.
 
 ## Development
 
 ```bash
-uv run pytest        # a throwaway git repo per test, with a fake glab: no network, no auth
+uv run pytest        # a throwaway git repo per test, with fake glab and gh: no network, no auth
 ```
 
 ## License
