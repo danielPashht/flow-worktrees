@@ -8,7 +8,8 @@ derived from the forge's answers -- GitLab through `glab`, GitHub through `gh` -
 `<primary>/local-docs/.flow-cache/forge.json` so the SessionStart hook stays offline.
 
 Human-only commands (`start`, `clean`, `migrate`, `set stage parked`, `install-hook`) refuse to run when
-CLAUDECODE=1 is set — that is the Claude Code Bash environment. FLOW_HUMAN=1 overrides.
+CLAUDECODE=1 (the Claude Code Bash environment) or FLOW_AGENT=1 (set it in any other agent's environment) is set.
+FLOW_HUMAN=1 overrides.
 
 Per-repo overrides live in `<primary>/local-docs/flow.local.yml`:
 
@@ -207,7 +208,8 @@ def is_dirty(path: Path) -> bool:
 
 
 def require_human(action: str) -> None:
-    if os.environ.get("CLAUDECODE") and not os.environ.get("FLOW_HUMAN"):
+    in_agent = os.environ.get("CLAUDECODE") or os.environ.get("FLOW_AGENT")
+    if in_agent and not os.environ.get("FLOW_HUMAN"):
         raise FlowError(
             f"`flow {action}` is human-only; run it from your own terminal "
             "(FLOW_HUMAN=1 overrides, for humans only).",

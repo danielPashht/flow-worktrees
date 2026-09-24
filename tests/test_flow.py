@@ -98,7 +98,7 @@ def env(tmp_path: Path) -> dict:
     glab.chmod(0o755)
     state = tmp_path / "glab.json"
     state.write_text(json.dumps({"mrs": {}}))
-    environ = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "FLOW_HUMAN")}
+    environ = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "FLOW_AGENT", "FLOW_HUMAN")}
     environ.update({"PATH": f"{bin_dir}:{environ['PATH']}", "FAKE_GLAB_STATE": str(state),
                     "FLOW_BACKGROUND_SYNC": "0"})
     return {"primary": primary, "origin": origin, "env": environ, "state": state, "tmp": tmp_path}
@@ -306,6 +306,12 @@ def test_start_is_human_only(env: dict) -> None:
     result = flow(env, "start", "PL-7", "smoke", claude=True)
     assert result.returncode == 3 and "human-only" in result.stderr
     assert flow(env, "start", "PL-7", "smoke", claude=True, human=True).returncode == 0
+
+
+def test_flow_agent_marks_any_agent_as_not_human(env: dict) -> None:
+    result = flow(env, "start", "PL-7", "smoke", extra_env={"FLOW_AGENT": "1"})
+    assert result.returncode == 3 and "human-only" in result.stderr
+    assert flow(env, "start", "PL-7", "smoke", human=True, extra_env={"FLOW_AGENT": "1"}).returncode == 0
 
 
 def test_start_creates_worktree_branch_symlink_task(env: dict) -> None:
@@ -1137,7 +1143,7 @@ def test_the_hook_asks_git_a_bounded_number_of_questions(env: dict) -> None:
 
 
 def _run_setup(*args: str, **extra_env: str) -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "FLOW_HUMAN")}
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDECODE", "FLOW_AGENT", "FLOW_HUMAN")}
     return subprocess.run([sys.executable, "-m", "flow_worktrees", *args], capture_output=True, text=True,
                           env={**env, **extra_env})
 

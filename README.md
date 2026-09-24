@@ -1,9 +1,8 @@
 # flow
 
-A command-line tool for working on several tasks at once in one git repository. Each task gets its own branch,
-worktree, and task file. `flow` reads the state of each task's merge request from GitLab or GitHub and prints one
-table of all tasks. Installed as a Claude Code hook, it puts that table into the agent's context at the start of
-every session.
+`flow` shows every open task in a repository as one table: its branch, worktree, merge request, whose move it is,
+and what to do next. Each task lives on its own branch in its own git worktree, with a task file that holds the next
+step. Run `flow status` in a terminal, or install it as a Claude Code hook so every new session starts with the table.
 
 ```
 $ flow status
@@ -30,7 +29,7 @@ $ flow status
 
 An AI agent starts every session without memory: it does not know which branch belongs to which task, what is
 pushed, or whose move it is on each review. `flow` gives it all of that before its first message. It reads a local
-cache, so the hook makes no network calls.
+cache, so the hook never waits on the network.
 
 ## Before you install
 
@@ -106,7 +105,8 @@ After the merge, `flow clean PROJ-12` removes the worktree and the branch and ar
 ## Concepts
 
 **Task file.** `local-docs/tasks/<KEY>.md`: YAML fields plus free notes. It stores only what the forge cannot know:
-title, next action, blockers, branch, worktree, and the stage before review. Everything else is computed.
+title, next action, blockers, branch, worktree, the stage before review, and the MR number of a task without a
+branch. Everything else is computed.
 
 **Stage.** The first four are stored in the task file and advanced by `flow next`. The rest are computed from the MR.
 
@@ -118,7 +118,7 @@ plan → refine → implement → test → review-wait ⇄ changes → merge-wai
 | Stage | Meaning |
 |---|---|
 | `review-wait` | The MR waits for someone: for you to mark the draft ready, or for reviewers. |
-| `changes` | Someone left a comment you have not answered, or the MR is approved but cannot merge yet. |
+| `changes` | Someone opened a review thread you have not answered, or the MR is approved but cannot merge yet. |
 | `merge-wait` | Approved, mergeable, no open threads. |
 | `merged` | Merged; waits for `flow clean`. |
 | `parked` | Blocked on something outside the task; `blocked_on` says what. |
@@ -134,7 +134,12 @@ until the MR changes.
 is older than an hour, the hook starts one refresh in the background.
 
 **Human-only commands.** `start`, `clean`, `migrate`, `set stage parked`, and `install-hook` refuse to run inside
-Claude Code (`CLAUDECODE=1`). The agent cannot start, park, or remove your tasks.
+Claude Code (`CLAUDECODE=1`) or when `FLOW_AGENT=1` is set. The agent cannot start, park, or remove your tasks.
+
+**Other agents.** Only the hook and `CLAUDECODE` are specific to Claude Code; every other command is a plain CLI. For
+another agent (Codex, Cursor, Aider, …), have it run `flow status --brief` at the start of a session, through its
+own startup hook or a line in its instructions file, and set `FLOW_AGENT=1` in its environment so the human-only
+commands refuse there too.
 
 ## Everyday commands
 

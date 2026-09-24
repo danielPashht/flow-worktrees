@@ -23,13 +23,18 @@ On GitHub the rules below read these facts:
 ## What is stored and what is computed
 
 The task file holds only what the forge cannot know: `next`, `blocked_on`, `title`, `docs`, notes, the branch, the
-worktree, and the local stage (`plan`/`refine`/`implement`/`test`, `parked`). The MR is found by branch; the post-MR
-stages (`review-wait`/`changes`/`merge-wait`/`merged`) and the ball are derived from the MR and its threads.
+worktree, `mr` (only for a task without a branch), and the local stage (`plan`/`refine`/`implement`/`test`,
+`parked`). Otherwise the MR is found by branch; the post-MR stages (`review-wait`/`changes`/`merge-wait`/`merged`)
+and the ball are derived from the MR and its threads.
 
 The forge's answers live in `local-docs/.flow-cache/forge.json`. `flow sync` refreshes them, and so do online
 `flow status`/`next`/`doctor`. The SessionStart hook reads only the cache and, when it is older than an hour, starts
 `flow sync` in the background (10-minute lock, log `.flow-cache/sync.log`); the next session sees the fresh result.
 `FLOW_BACKGROUND_SYNC=0` turns the background sync off.
+
+While it waits on the forge or git, flow shows a progress line on stderr (`gh: reading MRs 4/9`) and erases it
+before printing. It appears only when stderr is a terminal, so pipes and the hook never see it; `FLOW_PROGRESS=0`
+turns it off on a terminal too.
 
 | MR | Stage | Ball |
 |---|---|---|
@@ -64,7 +69,7 @@ journal collects what happened and when.
 
 | Who | Commands | How it is enforced |
 |---|---|---|
-| **Human only** | `flow start`, `flow clean`, `flow set stage parked`, `flow migrate`, `flow install-hook`; un-draft, approve, merge | refused when `CLAUDECODE=1` (the Bash environment inside Claude Code); `FLOW_HUMAN=1` overrides, for humans only |
+| **Human only** | `flow start`, `flow clean`, `flow set stage parked`, `flow migrate`, `flow install-hook`; un-draft, approve, merge | refused when `CLAUDECODE=1` (the Bash environment inside Claude Code) or `FLOW_AGENT=1` (set it for any other agent); `FLOW_HUMAN=1` overrides, for humans only |
 | **Agent** | `flow note`, `flow next` (plan → refine → implement → test; from test/changes — gate, push, MR), `flow sync`, `flow set ball … --why`, updating `next` after every state change | agent discipline; the mechanics (commits, pushes, reviews) are journalled without the agent |
 | **Automation** | SessionStart prints `flow status --brief` into the context; `flow status`/`flow next` read MR state from the forge | the hook `flow install-hook` adds |
 
@@ -85,13 +90,13 @@ plan → refine → implement → test → review-wait ⇄ changes → merge-wai
 |---|---|---|
 | plan → refine → implement → test | agent, `flow next` | none |
 | test → review-wait | agent, `flow next` | the `gate` command is green in the worktree, the branch is pushed with nothing ahead, the worktree is clean; the MR is found by branch, otherwise a Draft `<KEY>: <title>` is created. The file keeps `stage: test` |
-| review-wait ⇄ changes → merge-wait → merged | nobody: computed | per the table above; at these stages `flow next` only refreshes the cache and reports the stage |
+| review-wait ⇄ changes → merge-wait → merged | nobody: computed | per the table above; at `review-wait` and `merge-wait`, `flow next` only refreshes the cache and reports the stage |
 | changes → review-wait | agent, `flow next` | gate + push, as above; the stage changes once the forge sees the reply |
 | merged → cleaned | human, `flow clean` | MR merged, worktree clean |
 | * → parked | human, `flow set stage parked --blocked-on …` | a reason is required |
 
 When the forge is unreachable (`glab`/`gh` timeout), transitions that depend on it refuse with a reason;
-`flow status` shows `!N?` (a yellow MR badge on the board).
+`flow status` marks the MR with `?` (`!N?`, `#N?` on GitHub; a yellow MR badge on the board).
 
 ## Cycle
 
@@ -109,7 +114,7 @@ When the forge is unreachable (`glab`/`gh` timeout), transitions that depend on 
    not the one just done.
 3. **Hand off for review.** `flow next` from `test` runs the gate, requires a push, and creates a Draft MR. While
    the MR is Draft the stage is computed as `review-wait` with the ball on me. Un-drafting and calling reviewers is
-   the human's job; the hook reminds with an "un-draft !N" line.
+   the human's job; the hook reminds with an "un-draft !N" line (`#N` on GitHub).
 4. **Review.** Stage and ball follow the MR: threads arrive — `changes`/me; I reply — `review-wait`/them;
    approval — `merge-wait`. After fixes, `flow next` runs the gate and the push again.
 5. **Merge.** The human merges on the forge; after the next sync the task becomes `merged`.
@@ -159,10 +164,6 @@ approvals_required: 1
 `--no-gate --why "…"`. `forge:` (`gitlab` or `github`) overrides detection from `origin`'s host.
 
 ## Outputs for other tools
-
-While it waits on the forge or git, flow shows a progress line on stderr (`gh: reading MRs 4/9`) and erases it
-before printing. It appears only when stderr is a terminal, so pipes and the hook never see it; `FLOW_PROGRESS=0`
-turns it off on a terminal too.
 
 - `flow status --json` — the full row model; consumers read it by field name, and the key set is a tested contract.
 - `flow status --tsv` — for shell pipelines that cut by column position; columns are only ever appended.
