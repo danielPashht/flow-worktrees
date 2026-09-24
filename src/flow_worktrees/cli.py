@@ -37,6 +37,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -130,7 +131,51 @@ def split_csv(value: str) -> list[str]:
 
 
 def warn(message: str) -> None:
+    if Progress.active:
+        Progress.active.clear()  # the next tick redraws it below the warning
     sys.stderr.write(f"flow: {message}\n")
+
+
+class Progress:
+    """One self-overwriting line on stderr (`gh: reading MRs 4/9`) while slow work runs, erased when it ends.
+
+    Silent unless stderr is a terminal, so `--json` in a pipe, the hook and the tests never see it;
+    FLOW_PROGRESS=0 silences it on a terminal too.
+    """
+
+    active: "Progress | None" = None
+
+    def __init__(self, label: str, total: int, stream=None):
+        self.label, self.total, self.done = label, total, 0
+        self.stream = stream or sys.stderr
+        self.on = total > 0 and self.stream.isatty() and os.environ.get("FLOW_PROGRESS") != "0"
+        self.lock = threading.Lock()
+
+    def __enter__(self) -> "Progress":
+        if self.on:
+            Progress.active = self
+            self._draw()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.clear()
+        if Progress.active is self:
+            Progress.active = None
+
+    def tick(self) -> None:
+        with self.lock:
+            self.done += 1
+            self._draw()
+
+    def _draw(self) -> None:
+        if self.on:
+            self.stream.write(f"\r\033[K{self.label} {self.done}/{self.total}")
+            self.stream.flush()
+
+    def clear(self) -> None:
+        if self.on:
+            self.stream.write("\r\033[K")
+            self.stream.flush()
 
 
 def run(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess:
@@ -843,12 +888,20 @@ def iso_ts(value: str) -> int | None:
         return None
 
 
-def parallel(calls: list) -> list:
-    """Run zero-argument callables on a thread pool, results in order; the first FlowError propagates."""
+def parallel(calls: list, label: str | None = None) -> list:
+    """Run zero-argument callables on a thread pool, results in order; the first FlowError propagates.
+
+    With `label`, a progress line counts the finished calls.
+    """
     if not calls:
         return []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
-        return list(pool.map(lambda call: call(), calls))
+    with Progress(label or "", len(calls) if label else 0) as progress, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=SYNC_WORKERS) as pool:
+        def run_one(call):
+            result = call()
+            progress.tick()
+            return result
+        return list(pool.map(run_one, calls))
 
 
 def sync(repo: Repo, metas: list[dict], cache: ForgeCache, forge: Forge, prune: bool) -> None:
@@ -866,7 +919,7 @@ def sync(repo: Repo, metas: list[dict], cache: ForgeCache, forge: Forge, prune: 
         lookups["me"] = forge.username
     if stored:
         lookups["stored"] = lambda: forge.mrs_by_iid(stored)
-    found = dict(zip(lookups, parallel(list(lookups.values()))))
+    found = dict(zip(lookups, parallel(list(lookups.values()), f"{forge.cli}: finding MRs")))
     if "me" in found:
         cache.data["me"] = found["me"]
     raw: dict[int, dict] = dict(found.get("stored") or {})  # normalized MRs, each still carrying its `iid`
@@ -883,7 +936,7 @@ def sync(repo: Repo, metas: list[dict], cache: ForgeCache, forge: Forge, prune: 
     wanted = {iid: entry["state"] == "opened" for iid, entry in entries.items()
               if entry["state"] == "opened" or known.get(str(iid), {}).get("state") != entry["state"]}
     details = dict(zip(wanted, parallel([lambda i=i, o=is_open: forge.details(i, entries[i], o)
-                                         for i, is_open in wanted.items()])))
+                                         for i, is_open in wanted.items()], f"{forge.cli}: reading MRs")))
     for iid, entry in entries.items():
         if iid in details:
             entry.update(details[iid])
@@ -1168,7 +1221,7 @@ def status_rows(repo: Repo, brief: bool, cache: ForgeCache, forge: Forge | None)
     derived = [(meta, derive(meta, cache, repo.approvals_required)) for meta in metas]
     shown = [(meta, d) for meta, d in derived if not (brief and d.stage in INACTIVE and d.ball != "me")]
     repo.refs, repo.base_branch  # fill the process caches before the threads read them
-    rows = parallel([lambda m=m, d=d: status_row(repo, m, d, cache, current) for m, d in shown])
+    rows = parallel([lambda m=m, d=d: status_row(repo, m, d, cache, current) for m, d in shown], "git: tasks")
     rows.sort(key=lambda r: (STAGES.index(r["stage"]), r["key"]))
     return rows
 

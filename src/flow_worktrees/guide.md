@@ -160,6 +160,10 @@ approvals_required: 1
 
 ## Outputs for other tools
 
+While it waits on the forge or git, flow shows a progress line on stderr (`gh: reading MRs 4/9`) and erases it
+before printing. It appears only when stderr is a terminal, so pipes and the hook never see it; `FLOW_PROGRESS=0`
+turns it off on a terminal too.
+
 - `flow status --json` — the full row model; consumers read it by field name, and the key set is a tested contract.
 - `flow status --tsv` — for shell pipelines that cut by column position; columns are only ever appended.
 - `flow doctor [--fix]` — symlinks in every worktree (`--fix` relinks broken ones), branches without a task file,

@@ -1403,3 +1403,45 @@ def test_undetectable_forge_fails_only_where_a_forge_is_called(env: dict) -> Non
     assert result.returncode != 0 and "set `forge: gitlab` or `forge: github`" in result.stderr
     (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: bitbucket\n')
     assert "must be one of gitlab, github" in flow(env, "sync").stderr
+
+
+# --------------------------------------------------------------------------- progress line
+
+
+class _Tty(__import__("io").StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_progress_counts_calls_on_a_terminal_and_erases_itself(monkeypatch) -> None:
+    mod = _flow_module()
+    tty = _Tty()
+    monkeypatch.setattr(mod.sys, "stderr", tty)
+    monkeypatch.delenv("FLOW_PROGRESS", raising=False)
+    assert mod.parallel([lambda i=i: i * 2 for i in range(3)], "gh: reading MRs") == [0, 2, 4]
+    out = tty.getvalue()
+    assert "gh: reading MRs 0/3" in out and "gh: reading MRs 3/3" in out
+    assert out.endswith("\r\033[K")  # nothing left on the line for the table to collide with
+
+
+def test_progress_is_silent_off_a_terminal_and_when_disabled(monkeypatch) -> None:
+    mod = _flow_module()
+    pipe = __import__("io").StringIO()
+    monkeypatch.setattr(mod.sys, "stderr", pipe)
+    mod.parallel([lambda: 1], "gh: reading MRs")
+    assert pipe.getvalue() == ""
+    tty = _Tty()
+    monkeypatch.setattr(mod.sys, "stderr", tty)
+    monkeypatch.setenv("FLOW_PROGRESS", "0")
+    mod.parallel([lambda: 1], "gh: reading MRs")
+    assert tty.getvalue() == ""
+
+
+def test_a_warning_clears_the_progress_line_first(monkeypatch) -> None:
+    mod = _flow_module()
+    tty = _Tty()
+    monkeypatch.setattr(mod.sys, "stderr", tty)
+    monkeypatch.delenv("FLOW_PROGRESS", raising=False)
+    with mod.Progress("git: tasks", 2):
+        mod.warn("something odd")
+    assert "git: tasks 0/2\r\033[Kflow: something odd\n" in tty.getvalue()
