@@ -70,6 +70,10 @@ journal collects what happened and when.
 
 The human makes four decisions per task: start, un-draft, merge, clean. The agent drives the rest.
 
+A command typed with Claude Code's `!` prefix runs in the session's environment, so it carries `CLAUDECODE=1` and
+is refused like the agent's own. From inside a session, a human runs `! FLOW_HUMAN=1 flow …`; the plain way is a
+terminal of their own.
+
 ## Stages
 
 ```
