@@ -35,7 +35,8 @@ cache, so the hook never waits on the network.
 
 - **Forge:** GitLab or GitHub only, with its CLI authenticated: [`glab`](https://gitlab.com/gitlab-org/cli) or
   [`gh`](https://cli.github.com). Self-hosted GitLab and GitHub Enterprise work.
-- **Task keys:** Jira-style (`ABC-123`). Branches are named `<KEY>-<slug>`.
+- **Task keys:** Jira-style (`ABC-123`): only the format, Jira itself is optional (`jira_base:` adds links). Branches
+  are named `<KEY>-<slug>`; a branch without a key in front is not a task.
 - **`local-docs/`:** `flow` stores its files in `local-docs/` at the repository root and hides it from git. If your
   repository already tracks a `local-docs/`, rename it first.
 - **Tools:** git and [uv](https://docs.astral.sh/uv/).
@@ -63,7 +64,7 @@ task     local-docs/tasks/PROJ-12.md
 $ cd ../myrepo-12
 $ flow status
   key     stage ball branch                            wt mr updated next
-* PROJ-12 plan  me   PROJ-12-login-timeout +0/-0 local ok -  today   refine: read the task, fill notes and next
+* PROJ-12 plan  me   PROJ-12-login-timeout +0/-0 local ok -  today   study the code; write the plan into notes and next
 ```
 
 Work in the worktree. Record why you did something and what comes next:
@@ -77,9 +78,7 @@ Move through the stages with `flow next`. From `test`, it runs your check, requi
 
 ```
 $ flow next
-PROJ-12: plan → refine
-$ flow next
-PROJ-12: refine → implement
+PROJ-12: plan → implement
 $ flow next
 PROJ-12: implement → test
 $ git commit -am "PROJ-12: raise proxy timeout" && git push -u origin HEAD
@@ -108,10 +107,12 @@ After the merge, `flow clean PROJ-12` removes the worktree and the branch and ar
 title, next action, blockers, branch, worktree, the stage before review, and the MR number of a task without a
 branch. Everything else is computed.
 
-**Stage.** The first four are stored in the task file and advanced by `flow next`. The rest are computed from the MR.
+**Stage.** The first three are stored in the task file and advanced by `flow next`. They have no preconditions: they
+tell the agent what mode it is in (`plan`: study the code, don't write it). Only sending to review is checked (gate
+and push). The rest are computed from the MR.
 
 ```
-plan → refine → implement → test → review-wait ⇄ changes → merge-wait → merged → cleaned
+plan → implement → test → review-wait ⇄ changes → merge-wait → merged → cleaned
                                                                    ↘ parked (with a reason)
 ```
 

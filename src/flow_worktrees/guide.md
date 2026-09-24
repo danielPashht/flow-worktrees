@@ -23,7 +23,7 @@ On GitHub the rules below read these facts:
 ## What is stored and what is computed
 
 The task file holds only what the forge cannot know: `next`, `blocked_on`, `title`, `docs`, notes, the branch, the
-worktree, `mr` (only for a task without a branch), and the local stage (`plan`/`refine`/`implement`/`test`,
+worktree, `mr` (only for a task without a branch), and the local stage (`plan`/`implement`/`test`,
 `parked`). Otherwise the MR is found by branch; the post-MR stages (`review-wait`/`changes`/`merge-wait`/`merged`)
 and the ball are derived from the MR and its threads.
 
@@ -70,7 +70,7 @@ journal collects what happened and when.
 | Who | Commands | How it is enforced |
 |---|---|---|
 | **Human only** | `flow start`, `flow clean`, `flow set stage parked`, `flow migrate`, `flow install-hook`; un-draft, approve, merge | refused when `CLAUDECODE=1` (the Bash environment inside Claude Code) or `FLOW_AGENT=1` (set it for any other agent); `FLOW_HUMAN=1` overrides, for humans only |
-| **Agent** | `flow note`, `flow next` (plan → refine → implement → test; from test/changes — gate, push, MR), `flow sync`, `flow set ball … --why`, updating `next` after every state change | agent discipline; the mechanics (commits, pushes, reviews) are journalled without the agent |
+| **Agent** | `flow note`, `flow next` (plan → implement → test; from test/changes — gate, push, MR), `flow sync`, `flow set ball … --why`, updating `next` after every state change | agent discipline; the mechanics (commits, pushes, reviews) are journalled without the agent |
 | **Automation** | SessionStart prints `flow status --brief` into the context; `flow status`/`flow next` read MR state from the forge | the hook `flow install-hook` adds |
 
 The human makes four decisions per task: start, un-draft, merge, clean. The agent drives the rest.
@@ -82,13 +82,13 @@ terminal of their own.
 ## Stages
 
 ```
-plan → refine → implement → test → review-wait ⇄ changes → merge-wait → merged → cleaned
+plan → implement → test → review-wait ⇄ changes → merge-wait → merged → cleaned
                                                                    ↘ parked (blocked_on required)
 ```
 
 | Transition | Who | Precondition |
 |---|---|---|
-| plan → refine → implement → test | agent, `flow next` | none |
+| plan → implement → test | agent, `flow next` | none |
 | test → review-wait | agent, `flow next` | the `gate` command is green in the worktree, the branch is pushed with nothing ahead, the worktree is clean; the MR is found by branch, otherwise a Draft `<KEY>: <title>` is created. The file keeps `stage: test` |
 | review-wait ⇄ changes → merge-wait → merged | nobody: computed | per the table above; at `review-wait` and `merge-wait`, `flow next` only refreshes the cache and reports the stage |
 | changes → review-wait | agent, `flow next` | gate + push, as above; the stage changes once the forge sees the reply |
@@ -106,9 +106,9 @@ When the forge is unreachable (`glab`/`gh` timeout), transitions that depend on 
    cd ../myrepo-4801 && claude
    ```
    This creates branch `PROJ-4801-short-slug` from `origin/main`, worktree `../myrepo-4801`, the `local-docs`
-   symlink, and `local-docs/tasks/PROJ-4801.md` with `stage: plan`. A good first message to the agent: "read
-   `local-docs/tasks/PROJ-4801.md`, stage plan — study the code, fill in the notes and `next`, don't write code".
-2. **Refine → implement → test.** The agent works in the worktree. It records facts with
+   symlink, and `local-docs/tasks/PROJ-4801.md` with `stage: plan`; its `next` tells the agent to study the code and write the plan.
+2. **Plan → implement → test.** In Claude Code, plan in plan mode: once you approve the plan, the agent writes it
+   into the notes and `next` and runs `flow next`, so the plan outlives the session. The agent records facts with
    `flow note "…" [KEY] --next "…"` (KEY goes before the flags; without it the key comes from the branch) and
    advances the stage with `flow next` when the stage really changed. `next` always describes the **next action**,
    not the one just done.

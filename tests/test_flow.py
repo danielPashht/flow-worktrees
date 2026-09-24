@@ -142,8 +142,8 @@ def push(where: Path, branch: str = "PL-7-smoke") -> None:
 
 
 def to_test_stage(env: dict, wt: Path) -> None:
-    for _ in range(3):
-        flow(env, "next", cwd=wt, check=True)  # plan -> refine -> implement -> test
+    for _ in range(2):
+        flow(env, "next", cwd=wt, check=True)  # plan -> implement -> test
 
 
 def read_meta(env: dict, key: str, done: bool = False) -> dict:
@@ -361,9 +361,16 @@ def test_parking_is_human_only_and_needs_reason(env: dict) -> None:
 
 def test_next_walks_work_stages_from_branch(env: dict) -> None:
     wt = start(env)
-    for expected in ("refine", "implement", "test"):
+    for expected in ("implement", "test"):
         flow(env, "next", cwd=wt, check=True)
         assert read_meta(env, "PL-7")["stage"] == expected
+
+
+def test_a_stored_refine_reads_as_plan(env: dict) -> None:
+    write_task(env, "PL-7", stage="refine")
+    assert "PL-7 plan" in flow(env, "status", "--offline", check=True).stdout
+    flow(env, "next", "PL-7", check=True)
+    assert read_meta(env, "PL-7")["stage"] == "implement"
 
 
 def test_next_from_test_requires_push(env: dict) -> None:
@@ -615,8 +622,8 @@ def test_bad_user_input_is_a_flow_error_not_a_traceback(env: dict) -> None:
         assert "mr must be" in result.stderr or "must be positive" in result.stderr
     assert read_meta(env, "PL-7")["mr"] is None
     (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\ngate: "echo {nope}"\n')
-    for _ in range(3):
-        flow(env, "next", "PL-7", check=True)  # plan -> refine -> implement -> test
+    for _ in range(2):
+        flow(env, "next", "PL-7", check=True)  # plan -> implement -> test
     result = flow(env, "next", "PL-7")
     assert result.returncode == 1 and "bad placeholder" in result.stderr and "{base}" in result.stderr
     assert "Traceback" not in result.stderr

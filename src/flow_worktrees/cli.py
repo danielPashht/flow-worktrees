@@ -47,11 +47,11 @@ from typing import Literal, Protocol
 import yaml
 
 STAGES = [
-    "plan", "refine", "implement", "test",
+    "plan", "implement", "test",
     "review-wait", "changes", "merge-wait",
     "merged", "cleaned", "parked",
 ]
-WORK_STAGES = ["plan", "refine", "implement", "test"]
+WORK_STAGES = ["plan", "implement", "test"]
 INACTIVE = {"merged", "cleaned", "parked"}
 # Stages the forge decides; the task file never stores them (a legacy file still may, until `flow migrate`).
 FORGE_STAGES = {"review-wait", "changes", "merge-wait", "merged"}
@@ -407,6 +407,8 @@ def parse_task(path: Path) -> tuple[dict, str]:
         meta["updated"] = meta["updated"].isoformat()[:10]
     meta["blocked_on"] = list(meta.get("blocked_on") or [])
     meta["docs"] = list(meta.get("docs") or [])
+    if meta["stage"] == "refine":
+        meta["stage"] = "plan"  # refine was merged into plan; the next save stores it
     if meta["stage"] not in STAGES:
         raise FlowError(f"{path}: unknown stage {meta['stage']!r}")
     return meta, match.group(2)
@@ -1651,7 +1653,7 @@ def cmd_next(repo: Repo, args: argparse.Namespace) -> int:
     if stored == "parked":
         raise FlowError("task is parked; resume with `flow set stage <stage>`", EXIT_PRECONDITION)
     cache = ForgeCache(repo)
-    if stored in ("plan", "refine", "implement") and cache.iid_for(meta) is None:
+    if stored in ("plan", "implement") and cache.iid_for(meta) is None:
         meta["stage"] = WORK_STAGES[WORK_STAGES.index(stored) + 1]
         save_task(path, meta, body)
         print(f"{key}: {stored} → {meta['stage']}")
@@ -1740,7 +1742,7 @@ def cmd_start(repo: Repo, args: argparse.Namespace) -> int:
         meta, body = parse_task(path)
     else:
         meta, body = default_meta(key), ""
-        meta["next"] = "refine: read the task, fill notes and next"
+        meta["next"] = "study the code; write the plan into notes and next"
     meta["branch"] = branch
     meta["worktree"] = os.path.relpath(target, repo.primary)
     if args.title:
