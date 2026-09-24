@@ -1620,7 +1620,7 @@ def cmd_next(repo: Repo, args: argparse.Namespace) -> int:
     save_task(path, meta, body)
     after = derive(meta, cache, repo.approvals_required)
     moved = "" if after.stage != before.stage else " (nothing to advance until the MR moves)"
-    print(f"{key}: {before.stage} → {after.stage} (ball={after.ball}, from !{after.iid}){moved}")
+    print(f"{key}: {before.stage} → {after.stage} (ball={after.ball}, from {repo.words.prefix}{after.iid}){moved}")
     return 0
 
 

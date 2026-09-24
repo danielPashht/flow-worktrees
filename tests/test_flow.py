@@ -1312,7 +1312,7 @@ def test_github_next_from_test_creates_a_draft_pr(gh_env: dict) -> None:
     to_test_stage(gh_env, wt)
     push(wt)
     result = flow(gh_env, "next", cwd=wt, check=True)
-    assert "created Draft PR #1" in result.stdout
+    assert "created Draft PR #1" in result.stdout and "from #1)" in result.stdout
     assert stage_ball(gh_env) == ("review-wait", "me")
     assert "un-draft #1 (PL-7) in GitHub" in hook_context(gh_env)
 
