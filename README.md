@@ -31,6 +31,12 @@ An AI agent starts every session without memory: it does not know which branch b
 pushed, or whose move it is on each review. `flow` gives it all of that before its first message. It reads a local
 cache, so the hook never waits on the network.
 
+## Not for you if
+
+- You work on one task at a time: `git worktree` and a short prompt to the agent are enough.
+- Your branches do not start with a task key (`ABC-123-…`), and you will not rename them.
+- Your task tracker must be the only place for task notes.
+
 ## Before you install
 
 - **Forge:** GitLab or GitHub only, with its CLI authenticated: [`glab`](https://gitlab.com/gitlab-org/cli) or
