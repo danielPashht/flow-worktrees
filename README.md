@@ -1,8 +1,9 @@
 # flow
 
-`flow` shows every open task in a repository as one table: its branch, worktree, merge request, whose move it is,
-and what to do next. Each task lives on its own branch in its own git worktree, with a task file that holds the next
-step. Run `flow status` in a terminal, or install it as a Claude Code hook so every new session starts with the table.
+`flow` keeps a coding agent oriented across parallel tasks. Every session starts knowing where each one stands: its
+branch, its MR, and whose move it is. Each task lives on its own branch in its own git worktree, with a task file that
+holds the next step. Run `flow status` in a terminal, or install it as a Claude Code hook so every new session starts
+with the table. The hook reads a local cache, so it never waits on the network.
 
 ```
 $ flow status
@@ -24,12 +25,6 @@ $ flow status
 | `mr` | Merge request (PR on GitHub): `#36:opened`. `D`: draft. `?`: the forge has not answered yet. |
 | `updated` | Days since the task file last changed. |
 | `next` | The next action, written by you or the agent. |
-
-## Why
-
-An AI agent starts every session without memory: it does not know which branch belongs to which task, what is
-pushed, or whose move it is on each review. `flow` gives it all of that before its first message. It reads a local
-cache, so the hook never waits on the network.
 
 ## Not for you if
 
