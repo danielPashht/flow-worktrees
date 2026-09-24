@@ -1153,12 +1153,13 @@ def test_install_hook_adds_once_replaces_script_path_entry_and_keeps_other_hooks
     settings = tmp_path / "settings.json"
     other = {"type": "command", "command": "echo hi"}
     settings.write_text(json.dumps({"model": "x", "hooks": {"SessionStart": [
-        {"matcher": "startup", "hooks": [other, {"type": "command",
+        {"matcher": "startup", "hooks": [other, {"type": "command", "timeout": 15,
                                                  "command": "python3 ~/.claude/scripts/flow.py status --hook"}]}]}}))
     assert _run_setup("install-hook", "--settings", str(settings)).returncode == 0
     data = json.loads(settings.read_text())
     commands = [h["command"] for g in data["hooks"]["SessionStart"] for h in g["hooks"]]
     assert commands == ["echo hi", "flow status --hook"]
+    assert data["hooks"]["SessionStart"][0]["hooks"][1]["timeout"] == 15  # what the user set on the entry survives
     assert data["model"] == "x"
     assert (tmp_path / "settings.json.bak").exists()
 

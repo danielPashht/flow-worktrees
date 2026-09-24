@@ -1954,8 +1954,9 @@ def cmd_guide(args: argparse.Namespace) -> int:
 def merge_hook(settings: dict) -> dict:
     """Return settings with flow's SessionStart hook present exactly once.
 
-    An existing flow entry (any matcher, script-path or installed form) is replaced in place, so re-running is
-    idempotent and migrates a `python3 .../flow.py status --hook` entry to the installed command.
+    An existing flow entry (any matcher, script-path or installed form) gets the installed command in place, keeping
+    its other keys (`timeout`, ...), so re-running is idempotent and migrates a `python3 .../flow.py status --hook`
+    entry without dropping what the user set on it.
     """
     hooks = settings.setdefault("hooks", {})
     groups = hooks.setdefault("SessionStart", [])
@@ -1968,7 +1969,7 @@ def merge_hook(settings: dict) -> dict:
                 if found:
                     continue  # a duplicate flow entry: drop it
                 found = True
-                kept.append(wanted)
+                kept.append({**hook, **wanted})
             else:
                 kept.append(hook)
         group["hooks"] = kept
