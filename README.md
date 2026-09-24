@@ -1,11 +1,11 @@
 # flow
 
-**Keep track of many parallel tasks across sessions, for a human and an AI agent alike.**
+**AI agents start every session from zero and mix tasks up. `flow` hands the agent the state of every task before
+its first message.**
 
-With ten tickets open at once, context goes fast. Which branch belongs to which task, which worktree is it in, is it
-pushed, is there an MR, and whose move is it? An AI agent starts every session from zero and mixes tasks up; a
-human spends the morning digging through git. `flow` keeps one file per task and shows the agent a summary of every
-task at the start of each session.
+Branch, worktree, pushed or not, MR, whose move it is, and the next action: the agent reads all of it in the session
+context instead of digging through git to find where it left off, and without a single network call, because the
+hook reads a local cache. The same table saves the human the morning archaeology when ten tickets are open at once.
 
 The task file holds only what git and GitLab don't know: the next action, blockers, "why" notes, and the local
 stage of work. The MR, the stage after it, and whose move it is are computed from GitLab, and commits, pushes, and
