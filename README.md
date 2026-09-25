@@ -135,8 +135,9 @@ until the MR changes.
 **Cache.** Answers from the forge live in `local-docs/.flow-cache/forge.json`. Online commands refresh it. When it
 is older than an hour, the hook starts one refresh in the background.
 
-**Human-only commands.** `start`, `clean`, `migrate`, `set stage parked`, and `install-hook` refuse to run inside
-Claude Code (`CLAUDECODE=1`) or when `FLOW_AGENT=1` is set. The agent cannot start, park, or remove your tasks.
+**Human-only commands.** `clean`, `migrate`, `set stage parked`, and `install-hook` refuse to run inside
+Claude Code (`CLAUDECODE=1`) or when `FLOW_AGENT=1` is set. The agent can start a task you name, but cannot park
+or remove your tasks.
 
 **Other agents.** Only the hook and `CLAUDECODE` are specific to Claude Code; every other command is a plain CLI. For
 another agent (Codex, Cursor, Aider, …), have it run `flow status --brief` at the start of a session, through its

@@ -200,7 +200,7 @@ def write_task(env: dict, key: str, **fields) -> None:
 
 
 def start(env: dict, key: str = "PL-7", slug: str = "smoke") -> Path:
-    flow(env, "start", key, slug, "--title", "Smoke test", human=True, check=True)
+    flow(env, "start", key, slug, "--title", "Smoke test", check=True)
     return env["tmp"] / f"proj-{key.split('-')[1]}"
 
 
@@ -302,16 +302,15 @@ def test_html_board_writes_file_with_lanes_badges_and_blocked_links(env: dict) -
 # --------------------------------------------------------------------------- start / human guard
 
 
-def test_start_is_human_only(env: dict) -> None:
-    result = flow(env, "start", "PL-7", "smoke", claude=True)
-    assert result.returncode == 3 and "human-only" in result.stderr
-    assert flow(env, "start", "PL-7", "smoke", claude=True, human=True).returncode == 0
+def test_agent_can_start(env: dict) -> None:
+    assert flow(env, "start", "PL-7", "smoke", claude=True).returncode == 0
 
 
 def test_flow_agent_marks_any_agent_as_not_human(env: dict) -> None:
-    result = flow(env, "start", "PL-7", "smoke", extra_env={"FLOW_AGENT": "1"})
+    start(env)
+    result = flow(env, "clean", "PL-7", extra_env={"FLOW_AGENT": "1"})
     assert result.returncode == 3 and "human-only" in result.stderr
-    assert flow(env, "start", "PL-7", "smoke", human=True, extra_env={"FLOW_AGENT": "1"}).returncode == 0
+    assert flow(env, "clean", "PL-7", human=True, extra_env={"FLOW_AGENT": "1"}).returncode == 2  # past the guard
 
 
 def test_start_creates_worktree_branch_symlink_task(env: dict) -> None:
@@ -327,8 +326,8 @@ def test_start_creates_worktree_branch_symlink_task(env: dict) -> None:
 
 
 def test_start_rejects_bad_key_and_slug(env: dict) -> None:
-    assert flow(env, "start", "pl-7", "smoke", human=True).returncode == 1
-    assert flow(env, "start", "PL-7", "Bad_Slug", human=True).returncode == 1
+    assert flow(env, "start", "pl-7", "smoke").returncode == 1
+    assert flow(env, "start", "PL-7", "Bad_Slug").returncode == 1
 
 
 # --------------------------------------------------------------------------- set / note / next
@@ -628,7 +627,7 @@ def test_bad_user_input_is_a_flow_error_not_a_traceback(env: dict) -> None:
     assert result.returncode == 1 and "bad placeholder" in result.stderr and "{base}" in result.stderr
     assert "Traceback" not in result.stderr
     (env["primary"] / "local-docs" / "flow.local.yml").write_text('forge: gitlab\nworktree_dir: "../wt-{0}"\n')
-    result = flow(env, "start", "PL-8", "bad-template", human=True)
+    result = flow(env, "start", "PL-8", "bad-template")
     assert result.returncode == 1 and "worktree_dir" in result.stderr and "Traceback" not in result.stderr
     result = flow(env, "status", "--md", "--json", "--offline")
     assert result.returncode == 2 and "not allowed with" in result.stderr

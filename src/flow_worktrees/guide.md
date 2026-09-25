@@ -69,11 +69,12 @@ journal collects what happened and when.
 
 | Who | Commands | How it is enforced |
 |---|---|---|
-| **Human only** | `flow start`, `flow clean`, `flow set stage parked`, `flow migrate`, `flow install-hook`; un-draft, approve, merge | refused when `CLAUDECODE=1` (the Bash environment inside Claude Code) or `FLOW_AGENT=1` (set it for any other agent); `FLOW_HUMAN=1` overrides, for humans only |
-| **Agent** | `flow note`, `flow next` (plan → implement → test; from test/changes — gate, push, MR), `flow sync`, `flow set ball … --why`, updating `next` after every state change | agent discipline; the mechanics (commits, pushes, reviews) are journalled without the agent |
+| **Human only** | `flow clean`, `flow set stage parked`, `flow migrate`, `flow install-hook`; un-draft, approve, merge | refused when `CLAUDECODE=1` (the Bash environment inside Claude Code) or `FLOW_AGENT=1` (set it for any other agent); `FLOW_HUMAN=1` overrides, for humans only |
+| **Agent** | `flow start` (for the tasks the human names; several at once chained with `&&`), `flow note`, `flow next` (plan → implement → test; from test/changes — gate, push, MR), `flow sync`, `flow set ball … --why`, updating `next` after every state change | agent discipline; the mechanics (commits, pushes, reviews) are journalled without the agent |
 | **Automation** | SessionStart prints `flow status --brief` into the context; `flow status`/`flow next` read MR state from the forge | the hook `flow install-hook` adds |
 
-The human makes four decisions per task: start, un-draft, merge, clean. The agent drives the rest.
+The human makes four decisions per task: which task to start (the agent runs `flow start`), un-draft, merge,
+clean. The agent drives the rest.
 
 A command typed with Claude Code's `!` prefix runs in the session's environment, so it carries `CLAUDECODE=1` and
 is refused like the agent's own. From inside a session, a human runs `! FLOW_HUMAN=1 flow …`; the plain way is a
@@ -100,7 +101,8 @@ When the forge is unreachable (`glab`/`gh` timeout), transitions that depend on 
 
 ## Cycle
 
-1. **Start.** In the primary checkout:
+1. **Start.** Ask the agent to start the task (it runs `flow start`, and Claude Code asks you to approve the
+   command unless it is allowed), or run it yourself:
    ```bash
    flow start PROJ-4801 short-slug --title "What we are doing"
    cd ../myrepo-4801 && claude

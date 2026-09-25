@@ -7,7 +7,7 @@ The task file keeps only what the forge cannot know; the MR (a PR on GitHub), th
 derived from the forge's answers -- GitLab through `glab`, GitHub through `gh` -- cached in
 `<primary>/local-docs/.flow-cache/forge.json` so the SessionStart hook stays offline.
 
-Human-only commands (`start`, `clean`, `migrate`, `set stage parked`, `install-hook`) refuse to run when
+Human-only commands (`clean`, `migrate`, `set stage parked`, `install-hook`) refuse to run when
 CLAUDECODE=1 (the Claude Code Bash environment) or FLOW_AGENT=1 (set it in any other agent's environment) is set.
 FLOW_HUMAN=1 overrides.
 
@@ -1300,10 +1300,10 @@ def hook_context(repo: Repo, rows: list[dict], cache: ForgeCache) -> str:
     table = render_table(rows) + hook_extras(repo, rows) + render_overlaps(repo, rows) + cache_line(repo, cache)
     return (
         f"flow status ({repo.primary.name}, * = current branch). Task files: {repo.tasks_dir}\n{table}\n"
-        "flow commands — agent: `flow note \"...\" [KEY] --next \"...\"`, `flow next [KEY]`, "
+        "flow commands — agent: `flow start KEY slug --title ...` (when asked), `flow note \"...\" [KEY] --next \"...\"`, `flow next [KEY]`, "
         "`flow set <field> <value> [KEY]` (`flow set ball them --why ...` pins the ball), "
         "`flow status [--brief]`, `flow log [KEY]`, `flow sync`, `flow doctor`; "
-        "human-only (own terminal): `flow start KEY slug --title ...`, `flow clean KEY`, "
+        "human-only (own terminal): `flow clean KEY`, "
         f"`flow set stage parked --blocked-on ...`, `flow migrate`. Full guide: `flow guide`. "
         "Update `next:` before ending the session."
     )
@@ -1719,7 +1719,6 @@ def link_local_docs(repo: Repo, worktree: Path) -> None:
 
 
 def cmd_start(repo: Repo, args: argparse.Namespace) -> int:
-    require_human("start")
     key, slug = args.key, args.slug
     if not KEY_RE.match(key):
         raise FlowError(f"{key!r} is not a task key (expected e.g. PL-1234)")
@@ -2089,7 +2088,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--offline", action="store_true", help="skip the forge")
     p.set_defaults(func=cmd_board)
 
-    p = sub.add_parser("start", help="[human] worktree + branch + task file")
+    p = sub.add_parser("start", help="worktree + branch + task file")
     p.add_argument("key")
     p.add_argument("slug")
     p.add_argument("--title", default="")
